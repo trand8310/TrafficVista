@@ -1,0 +1,27 @@
+Net 模块端到端自检：
+场景一 ipzan 文本供应商端到端：代理 + IpInfo 完整 JSON，请求经代理 ✔
+场景二 vendor-b JSON 供应商端到端：proxy/认证/expire 统一转换 ✔
+场景三 路由错误：缺省默认供应商 / 未知供应商标识 ✔
+场景四 领取失败：领取接口 HTTP 500 明确报告 ✔
+场景五 领取失败：返回内容无有效 ip:port ✔
+场景六 领取失败：JSON 供应商 code 非 0 报告 msg ✔
+场景七 IpInfo 失败：正文不是有效 JSON ✔
+场景八 IpInfo 失败：HTTP 404 ✔
+场景九 IpInfo 失败：1 秒超时明确报告（实测 1.28s）✔
+场景十 取消：取消令牌原样传播 ✔
+场景十一 有效期：领取后计时、查询耗时计入、到期整体失败 ✔
+场景十二 并发隔离：供应商上限 2 / IpInfo 总上限 1，互不串扰 ✔
+场景十三 配置换源：供应商标识不变，仅改 ApiUrl ✔
+场景十四 出厂配置：ipzan 已接线，secret 可脱敏，多 IpInfo 接口竞速，路由可用 ✔
+场景十五 IpInfo 多接口竞速：谁快用谁的（3ms 胜出），其余取消 ✔
+场景十六 IpInfo 全部接口失败：明确报 ipinfo 阶段错误 ✔
+场景十七 白名单接口就位：出口 IP 直连竞速 + {ip} 占位登记，未配置即跳过（不自动调用） ✔
+场景十八 瑕疵代理重试：拿不到真实 IP 即丢弃换新代理，次数受 AcquireRetryCount 控制 ✔
+场景十九 领取 URL 调用方传入优先（对所有供应商统一生效），未传回退配置，不合法报 route ✔
+场景二十 供应商JSON出口字段提取、跳过详情查询、异常字段回退查询 ✔
+场景二十一 ipzan实际请求参数、JSON出口IP及毫秒截止时间、缺失出口回退、强制详情、TXT关闭开关、过期/空列表/业务失败 ✔
+场景二十二 实际HTTP直连竞速、完整出口详情、不领代理/不设路由/不使用代理TTL、全部失败及取消传播 ✔
+场景二十三 shenlong 默认路由、TXT认证/TTL、真实IP开关、URL覆盖、单次详情补查、未知JSON/无效TXT失败、取消和禁用 ✔
+场景二十三 xingyu 默认路由、TXT认证/TTL、真实IP开关、URL覆盖、单次详情补查、未知JSON/无效TXT失败、取消和禁用 ✔
+
+全部通过：Vendors=4，Timeout=distinct，Cancel=propagated，TTL=expiry-fails，Concurrency=isolated，IpInfoRace=fastest-wins，Whitelist=standby，Retry=defect-reacquire，UrlOverride=caller-wins。

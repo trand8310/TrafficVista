@@ -52,10 +52,23 @@ internal static class SettingsIntegrationTest
             || section.Value<string>("FutureOption") != "keep" || saved.Value<string>("Other") != "keep"
             || File.ReadAllText(defaultsPath) != originalDefaults) throw new InvalidOperationException("字段清理或文件保护失败。");
         var scheduler = settings.CreateSchedulerOptions(updated);
-        if (scheduler.WorkerCount != 50 || scheduler.LocalCache is not { LoadOnStart: true }
+        if (scheduler.WorkerCount != 50 || scheduler.LocalCache is not null
             || scheduler.QueueCapacity != 32 || scheduler.PollInterval.TotalMilliseconds != 350
             || scheduler.EmptyPollInterval.TotalMilliseconds != 350 || scheduler.CompleteWhenSourceEmpty)
             throw new InvalidOperationException("持续轮询配置映射失败。");
+        if (settings.Business.ExportRunData || settings.Business.TaskRecoveryMode != Business.TaskRecoveryMode.Discard)
+            throw new InvalidOperationException("默认应关闭运行导出和任务恢复。");
+        var saveDefaults = JObject.Parse(originalDefaults);
+        saveDefaults["Business"]!["TaskRecoveryMode"] = "Save";
+        File.WriteAllText(defaultsPath, saveDefaults.ToString());
+        var saving = new TrafficVistaSettings(directory).CreateSchedulerOptions(updated);
+        if (saving.LocalCache is not { LoadOnStart: true })
+            throw new InvalidOperationException("Save模式没有启用待执行任务持久化和启动恢复。");
+        saveDefaults["Business"]!["TaskRecoveryMode"] = "Discard";
+        File.WriteAllText(defaultsPath, saveDefaults.ToString());
+        if (new TrafficVistaSettings(directory).CreateSchedulerOptions(updated).LocalCache is not null)
+            throw new InvalidOperationException("Discard模式应忽略待恢复收件箱。");
+        File.WriteAllText(defaultsPath, originalDefaults);
         var largestQueue = settings.CreateSchedulerOptions(updated with { MaxConcurrency = 1024, Multiple = 1000 });
         largestQueue.Validate();
         if (largestQueue.QueueCapacity != 2_048_000

@@ -49,7 +49,7 @@ public sealed class IpzanProxyAdapter : IProxyVendorAdapter
             .Select(value => value.Trim()).Where(value => value.Length > 0).ToArray();
         if (requested.Length == 0) return apiUrl;
         if (requested.Any(value => value.Equals("全部", StringComparison.Ordinal) || value.Equals("all", StringComparison.OrdinalIgnoreCase)))
-            return SetParameter(apiUrl, "area", null);
+            return apiUrl;// SetParameter(apiUrl, "area", null);
         var map = regionMap ?? Regions.Value;
         var codes = new HashSet<string>(StringComparer.Ordinal);
         foreach (var item in requested)

@@ -25,7 +25,8 @@ internal static class AppServices
         // 在 Main 的 UI 消息循环启动前解析；只有这里创建并由容器释放 IPlaywright。
         services.AddSingleton<IPlaywright>(_ => Playwright.CreateAsync().GetAwaiter().GetResult());
         services.AddSingleton(provider => new BrowserLaunchLimiter(
-            provider.GetRequiredService<TrafficVistaSettings>().MaxConcurrentBrowserStarts));
+            provider.GetRequiredService<TrafficVistaSettings>().MaxConcurrentBrowserStarts,
+            provider.GetRequiredService<TrafficVistaSettings>().BrowserStartIntervalMilliseconds));
         services.AddSingleton(provider => new ChromeInstanceManager(
             provider.GetRequiredService<IPlaywright>(), provider.GetRequiredService<BrowserLaunchLimiter>(),
             logger, userRoot));

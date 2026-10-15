@@ -18,16 +18,28 @@ internal static class AppLogging
     public static void Configure(bool testMode = false)
     {
         _testMode = testMode;
-        Directory.CreateDirectory(LogDirectory);
         SelfLog.Enable(message => Trace.WriteLine(message));
-        Log.Logger = new LoggerConfiguration()
+        var configuration = new LoggerConfiguration()
             .MinimumLevel.ControlledBy(LevelSwitch)
             .Enrich.WithProperty("Application", "TrafficVista")
             .Enrich.WithProperty("ProcessId", Environment.ProcessId)
             .Enrich.WithProperty("RunId", Guid.NewGuid().ToString("N"))
             .Enrich.WithProperty("RunMode", testMode ? "self-test" : "interactive")
-            .WriteTo.Sink(new UiLogging.LiveLogSink(LiveLogs))
-            .WriteTo.File(
+            .WriteTo.Sink(new UiLogging.LiveLogSink(LiveLogs));
+        var fileEnabled = testMode;
+        if (!testMode)
+        {
+            try
+            {
+                var settings = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "appsettings.json")));
+                fileEnabled = settings["Logging"]?.Value<bool?>("FileEnabled") ?? false;
+            }
+            catch (Exception ex) { Trace.WriteLine("读取文件日志配置失败：" + ex.Message); }
+        }
+        if (fileEnabled)
+        {
+            Directory.CreateDirectory(LogDirectory);
+            configuration.WriteTo.File(
                 Path.Combine(LogDirectory, "trafficvista-.log"),
                 rollingInterval: RollingInterval.Day,
                 fileSizeLimitBytes: 10 * 1024 * 1024,
@@ -36,7 +48,8 @@ internal static class AppLogging
                 buffered: false,
                 shared: true,
                 encoding: new UTF8Encoding(false),
-                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] [PID:{ProcessId}] [Run:{RunId}] [{RunMode}] [{SourceContext}] [Instance:{InstanceId}] {Message:lj}{NewLine}{Exception}")
-            .CreateLogger();
+                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] [PID:{ProcessId}] [Run:{RunId}] [{RunMode}] [{SourceContext}] [Instance:{InstanceId}] {Message:lj}{NewLine}{Exception}");
+        }
+        Log.Logger = configuration.CreateLogger();
     }
 }

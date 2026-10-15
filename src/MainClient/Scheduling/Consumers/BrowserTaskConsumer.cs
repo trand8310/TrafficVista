@@ -33,6 +33,7 @@ public sealed class BrowserTaskConsumer : IPreparedTaskConsumer<TaskEnvelope>, I
     private readonly BusinessMetrics _metrics;
     private readonly SessionRetention _retention;
     private TrafficVistaOptions _options = new();
+    private int _hiddenMode;
     private int _activeTasks;
     private int _preparedTasks;
     private int _activeUvs;
@@ -54,9 +55,10 @@ public sealed class BrowserTaskConsumer : IPreparedTaskConsumer<TaskEnvelope>, I
         _logger = logger.ForContext<BrowserTaskConsumer>();
         _metrics = metrics ?? new BusinessMetrics();
         _pressureProbe = pressureProbe;
-        _admission = new(1, _metrics, _pressureProbe);
+        _admission = CreateAdmission(1);
         _retention = new SessionRetention(business, _logger);
-        _root = Path.GetFullPath(business.SessionRoot, AppContext.BaseDirectory);
+        _root = business.ExportRunData ? Path.GetFullPath(business.SessionRoot, AppContext.BaseDirectory)
+            : Path.Combine(Path.GetTempPath(), "TrafficVista", "uv");
     }
 
     public void Configure(TrafficVistaOptions options)
@@ -65,10 +67,16 @@ public sealed class BrowserTaskConsumer : IPreparedTaskConsumer<TaskEnvelope>, I
             throw new InvalidOperationException("消费者仍有任务未退出。");
         options.Validate();
         _admission.Dispose();
-        _admission = new(options.MaxConcurrency, _metrics, _pressureProbe);
+        _admission = CreateAdmission(options.MaxConcurrency);
         _options = options with { };
+        UpdateHiddenMode(options.IsHiddenMode);
         _peak = 0;
     }
+
+    internal void UpdateHiddenMode(bool hidden) => Volatile.Write(ref _hiddenMode, hidden ? 1 : 0);
+
+    private TaskCapacityAdmission CreateAdmission(int concurrency) => new(concurrency, _metrics, _pressureProbe,
+        (paused, reason) => { if (paused) _logger.Warning("暂停获取新任务：{Reason}", reason); else _logger.Information("{Reason}", reason); });
 
     public async ValueTask<bool> ConsumeAsync(TaskEnvelope task, CancellationToken token)
     {
@@ -100,14 +108,13 @@ public sealed class BrowserTaskConsumer : IPreparedTaskConsumer<TaskEnvelope>, I
             if (plan is not null)
             {
                 var waiting = Stopwatch.GetTimestamp();
-                reservation = await _admission.ReserveAsync(plan, _options, token).ConfigureAwait(false);
-                // Wait for the first launch window before consuming the task or acquiring its expiring IP.
-                await reservation.WaitUntilStartDueAsync(_options.UvExecutionInterval, token).ConfigureAwait(false);
+                using (_metrics.Track("任务准入"))
+                    reservation = await _admission.ReserveAsync(plan, _options, token).ConfigureAwait(false);
                 _metrics.Stage("taskAdmission", Stopwatch.GetElapsedTime(waiting));
-                _logger.Information("任务准入，TaskId={TaskId}，UV={Uvs}，预留并发={Slots}，预计完成={EstimatedMs}ms，已知有效期风险={AtRisk}",
+                _logger.Information("任务进入执行池，TaskId={TaskId}，UV={Uvs}，首UV名额={Slots}，理想预计完成={EstimatedMs}ms，已知有效期风险={AtRisk}",
                     task.Id, plan.Uvs, reservation.Slots, reservation.EstimatedCompletionMs, reservation.DeadlineAtRisk);
                 if (reservation.DeadlineAtRisk)
-                    _logger.Warning("任务预计耗时超过已知 IP 有效期，等待无法解决自身计划不足，按资源允许的名额尽力执行，TaskId={TaskId}", task.Id);
+                    _logger.Warning("任务理想耗时超过已知IP有效期，按设定并发和本任务UV间隔继续执行，TaskId={TaskId}", task.Id);
             }
             token.ThrowIfCancellationRequested();
             return new PreparedConsumption(this, task, reservation);
@@ -159,38 +166,43 @@ public sealed class BrowserTaskConsumer : IPreparedTaskConsumer<TaskEnvelope>, I
         try { plan = ParsePlan(task); jstext = ParseJstext(task); }
         catch (InvalidDataException ex)
         {
-            var recovery = Path.GetFullPath(_business.RecoveryRoot, AppContext.BaseDirectory);
-            Directory.CreateDirectory(recovery);
-            await File.WriteAllTextAsync(Path.Combine(recovery, Guid.NewGuid().ToString("N") + ".task.json"),
-                JsonConvert.SerializeObject(new { Task = task, Error = ex.Message }), CancellationToken.None).ConfigureAwait(false);
+            if (_business.ExportRunData || _business.TaskRecoveryMode == TaskRecoveryMode.Save)
+            {
+                var recovery = Path.GetFullPath(_business.RecoveryRoot, AppContext.BaseDirectory);
+                Directory.CreateDirectory(recovery);
+                await File.WriteAllTextAsync(Path.Combine(recovery, Guid.NewGuid().ToString("N") + ".task.json"),
+                    JsonConvert.SerializeObject(new { Task = task, Error = ex.Message }), CancellationToken.None).ConfigureAwait(false);
+            }
             throw;
         }
         var (uvCount, pageViews, minimumDwell, maximumDwell) = plan;
         if (reservation is null) throw new InvalidOperationException("有效任务必须先预留执行名额。");
-        var options = _options;
+        // 每项任务开始执行时取最新模式；任务内全部UV使用同一份快照。
+        var options = _options with { IsHiddenMode = Volatile.Read(ref _hiddenMode) != 0 };
         Interlocked.Increment(ref _activeTasks);
         try
         {
-            await _retention.SweepAsync().ConfigureAwait(false);
+            if (_business.ExportRunData) await _retention.SweepAsync().ConfigureAwait(false);
             // 同一任务 ID 可能同时被多个调度器/多轮复制消费：每次消费独立运行目录，互不影响、互不复用。
             var runDirectory = Path.Combine(_root, task.Id.ToString(CultureInfo.InvariantCulture),
                 $"{DateTime.UtcNow:yyyyMMdd-HHmmssfff}-{Environment.ProcessId}-{Guid.NewGuid().ToString("N")[..8]}");
-            Directory.CreateDirectory(runDirectory);
-            using var runLease = new FileStream(Path.Combine(runDirectory, "run.lock"), FileMode.OpenOrCreate,
-                FileAccess.ReadWrite, FileShare.None);
+            if (_business.ExportRunData) Directory.CreateDirectory(runDirectory);
+            using var runLease = _business.ExportRunData ? new FileStream(Path.Combine(runDirectory, "run.lock"), FileMode.OpenOrCreate,
+                FileAccess.ReadWrite, FileShare.None) : null;
             var queuedAt = Stopwatch.GetTimestamp();
             var ownsSlot = false;
             var started = Stopwatch.GetTimestamp();
             var succeeded = 0;
             var finished = 0;
             var dispatched = 0;
+            _metrics.PlanUvs(uvCount);
             string? failure = null;
             var pending = new List<Task<bool>>();
             BusinessProxy? proxy = null;
             using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(token);
             try
             {
-                await File.WriteAllTextAsync(Path.Combine(runDirectory, "task.json"),
+                if (_business.ExportRunData) await File.WriteAllTextAsync(Path.Combine(runDirectory, "task.json"),
                     BuildTaskSnapshot(task, uvCount, pageViews, null, jstext), token).ConfigureAwait(false);
                 // 先取得首个 UV 许可再领取代理，避免领取后完全排不上 UV。
                 await reservation.AcquireUvAsync(token).ConfigureAwait(false);
@@ -202,7 +214,8 @@ public sealed class BrowserTaskConsumer : IPreparedTaskConsumer<TaskEnvelope>, I
                 try
                 {
                     var proxyStarted = Stopwatch.GetTimestamp();
-                    proxy = await _proxies.AcquireAsync(task, options, token).ConfigureAwait(false);
+                    using (_metrics.Track("代理/出口信息"))
+                        proxy = await _proxies.AcquireAsync(task, options, token).ConfigureAwait(false);
                     _admission.ObserveProxyLifetime(proxy, options.IpTtl);
                     if (proxy?.Deadline(options.IpTtl) is { } acquiredDeadline
                         && (acquiredDeadline - DateTimeOffset.UtcNow).TotalMilliseconds < reservation.EstimatedCompletionMs)
@@ -214,11 +227,12 @@ public sealed class BrowserTaskConsumer : IPreparedTaskConsumer<TaskEnvelope>, I
                 { throw; }
                 catch (Exception ex)
                 {
+                    _metrics.Failure("代理/出口信息");
                     _logger.Error(ex, "代理获取失败（含重试次数用尽），TaskId={TaskId} 已丢弃，接下一个任务。", task.Id);
                     failure = "proxy: " + ex.Message;
                     return false;
                 }
-                await File.WriteAllTextAsync(Path.Combine(runDirectory, "task.json"),
+                if (_business.ExportRunData) await File.WriteAllTextAsync(Path.Combine(runDirectory, "task.json"),
                     BuildTaskSnapshot(task, uvCount, pageViews, proxy, jstext), token).ConfigureAwait(false);
                 // IpTtl 是代理 IP 在本任务全部 UV 执行期间的有效期：超时即取消在途会话并清理该任务占用的资源。
                 if (proxy?.Deadline(options.IpTtl) is { } deadline)
@@ -236,14 +250,15 @@ public sealed class BrowserTaskConsumer : IPreparedTaskConsumer<TaskEnvelope>, I
                         runToken.ThrowIfCancellationRequested();
                         if (!ownsSlot)
                         {
-                            await reservation.WaitUntilStartDueAsync(options.UvExecutionInterval, runToken).ConfigureAwait(false);
+                            using (_metrics.Track("UV限速"))
+                                await reservation.WaitUntilStartDueAsync(options.UvExecutionInterval, runToken).ConfigureAwait(false);
                             queuedAt = Stopwatch.GetTimestamp();
-                            await reservation.AcquireUvAsync(runToken).ConfigureAwait(false);
+                            using (_metrics.Track("UV名额")) await reservation.AcquireUvAsync(runToken).ConfigureAwait(false);
                             ownsSlot = true;
                             _metrics.Stage("uvQueue", Stopwatch.GetElapsedTime(queuedAt));
                         }
                         var rateStarted = Stopwatch.GetTimestamp();
-                        await reservation.StartUvAsync(options.UvExecutionInterval, runToken).ConfigureAwait(false);
+                        using (_metrics.Track("UV限速")) await reservation.StartUvAsync(options.UvExecutionInterval, runToken).ConfigureAwait(false);
                         _metrics.Stage("uvRateLimit", Stopwatch.GetElapsedTime(rateStarted));
                         // 只保留在途任务，已完成结果立即计入摘要，不随 uvCount 增长。
                         for (var p = pending.Count - 1; p >= 0; p--)
@@ -287,12 +302,13 @@ public sealed class BrowserTaskConsumer : IPreparedTaskConsumer<TaskEnvelope>, I
             catch (Exception ex) { failure = token.IsCancellationRequested ? "canceled" : ex.Message; throw; }
             finally
             {
+                _metrics.Undispatched(uvCount - dispatched);
                 if (ownsSlot) reservation.ReleaseUv();
                 // Snapshot/result remain reviewable for proxy failures and cancellation as well as partial success.
                 var remainingResults = await Task.WhenAll(pending).ConfigureAwait(false);
                 succeeded += remainingResults.Count(result => result);
                 finished += remainingResults.Length;
-                await File.WriteAllTextAsync(Path.Combine(runDirectory, "summary.json"), new JObject
+                if (_business.ExportRunData) await File.WriteAllTextAsync(Path.Combine(runDirectory, "summary.json"), new JObject
                 {
                     ["taskId"] = task.Id, ["deliveryId"] = task.DeliveryId, ["plannedUvs"] = uvCount,
                     ["dispatchedUvs"] = dispatched, ["succeededUvs"] = succeeded,
@@ -305,6 +321,7 @@ public sealed class BrowserTaskConsumer : IPreparedTaskConsumer<TaskEnvelope>, I
                     ["elapsedMs"] = Stopwatch.GetElapsedTime(started).TotalMilliseconds,
                     ["finishedAt"] = DateTimeOffset.UtcNow
                 }.ToString(), CancellationToken.None).ConfigureAwait(false);
+                if (!_business.ExportRunData) RemoveTemporaryRun(runDirectory);
             }
         }
         finally { Interlocked.Decrement(ref _activeTasks); }
@@ -315,6 +332,7 @@ public sealed class BrowserTaskConsumer : IPreparedTaskConsumer<TaskEnvelope>, I
         TaskCapacityAdmission.Reservation reservation, CancellationToken token)
     {
         var active = Interlocked.Increment(ref _activeUvs);
+        _metrics.DispatchUv();
         int observed;
         do { observed = _peak; if (active <= observed) break; }
         while (Interlocked.CompareExchange(ref _peak, active, observed) != observed);
@@ -325,25 +343,28 @@ public sealed class BrowserTaskConsumer : IPreparedTaskConsumer<TaskEnvelope>, I
         string? uvError = null;
         try
         {
-            Directory.CreateDirectory(directory);
+            if (_business.ExportRunData) Directory.CreateDirectory(directory);
             var deviceStarted = Stopwatch.GetTimestamp();
-            var device = await _devices.AcquireAsync(options, taskId, uvIndex, token).ConfigureAwait(false);
+            BusinessDeviceProfile device;
+            using (_metrics.Track("设备接口"))
+                device = await _devices.AcquireAsync(options, taskId, uvIndex, token).ConfigureAwait(false);
             _metrics.Stage("device", Stopwatch.GetElapsedTime(deviceStarted));
             var run = new BusinessUvRun(taskId, uvIndex, target, directory, device, proxy, options, dwell, pageViews, jstext)
                 { MaximumDwell = maximumDwell };
-            await File.WriteAllTextAsync(Path.Combine(directory, "device.json"),
+            if (_business.ExportRunData) await File.WriteAllTextAsync(Path.Combine(directory, "device.json"),
                 JToken.FromObject(device).ToString(), token).ConfigureAwait(false);
             phase = "execution";
             success = await _runner.RunAsync(run, token).ConfigureAwait(false);
+            if (!success) _metrics.Failure("执行返回未成功");
             return success;
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         { uvError = "canceled"; _logger.Information("业务 UV 已取消，TaskId={TaskId}，UvIndex={UvIndex}", taskId, uvIndex); return false; }
         catch (Exception ex)
-        { uvError = ex.Message; _logger.Error(ex, "业务 UV 失败，TaskId={TaskId}，UvIndex={UvIndex}", taskId, uvIndex); return false; }
+        { uvError = ex.Message; if (phase == "device") _metrics.Failure("设备接口"); _logger.Error(ex, "业务 UV 失败，TaskId={TaskId}，UvIndex={UvIndex}", taskId, uvIndex); return false; }
         finally
         {
-            if (!success && Directory.Exists(directory) && !File.Exists(Path.Combine(directory, "result.json")))
+            if (_business.ExportRunData && !success && Directory.Exists(directory) && !File.Exists(Path.Combine(directory, "result.json")))
             {
                 try
                 {
@@ -361,6 +382,21 @@ public sealed class BrowserTaskConsumer : IPreparedTaskConsumer<TaskEnvelope>, I
                 (double)options.PageLoadingDelay), Stopwatch.GetElapsedTime(started), success);
             Interlocked.Decrement(ref _activeUvs); reservation.ReleaseUv();
         }
+    }
+
+    private void RemoveTemporaryRun(string directory)
+    {
+        var root = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "TrafficVista", "uv")).TrimEnd(Path.DirectorySeparatorChar);
+        var target = Path.GetFullPath(directory);
+        if (!target.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("临时会话目录不在本应用临时根目录内。");
+        try
+        {
+            if (Directory.Exists(target) && (File.GetAttributes(target) & FileAttributes.ReparsePoint) == 0)
+                Directory.Delete(target, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        { _logger.Warning("临时浏览器目录暂未清理，Path={Path}，Reason={Reason}", target, ex.Message); }
     }
 
     private (int UvCount, int PageViews, double MinimumDwell, double MaximumDwell) ParsePlan(TaskEnvelope task)

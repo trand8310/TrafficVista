@@ -6,7 +6,10 @@ namespace TrafficVista.Business;
 
 /// <summary>设备接口返回的单台设备指纹；DeviceKey 在发放时分配，保证每次 UV 会话唯一。</summary>
 public sealed record BusinessDeviceProfile(string DeviceKey, string Make, string Model, string Name, string OsVersion,
-    int ScreenWidth, int ScreenHeight, string UserAgent, int CpuCores, string Vendor, string Renderer, string? Oaid);
+    int ScreenWidth, int ScreenHeight, string UserAgent, int CpuCores, string Vendor, string Renderer, string? Oaid)
+{
+    public float? DevicePixelRatio { get; init; }
+}
 
 /// <summary>
 /// 任务网络出口信息。代理模式 Server 为裸 host:port；直连信息的 Server 为 null。

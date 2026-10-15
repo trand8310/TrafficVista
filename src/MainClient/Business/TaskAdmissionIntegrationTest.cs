@@ -17,17 +17,167 @@ internal static class TaskAdmissionIntegrationTest
     internal static async Task<string> RunAsync(ILogger logger)
     {
         var report = new StringBuilder();
+        VerifyDispatchWindow(report);
         var root = Path.Combine(AppContext.BaseDirectory, "demo-output", "admission", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
-        await VerifyReservationsAsync(report);
+        await VerifySharedPoolAsync(report);
+        await VerifyLaunchPacingAsync(report);
+        await VerifySetupTimeoutAsync(report);
         await VerifyManyWorkersAsync(root, logger, report);
-        await VerifyIpPriorityAsync(root, logger, report);
-        await VerifyFirstLaunchWindowAsync(root, logger, report);
         await VerifyPendingRecoveryAsync(root, logger, report);
         await VerifyFetchWaitAsync(report);
         await VerifyGracefulCloseAsync(logger, report);
+        await VerifyRuntimeHiddenModeAsync(root, logger, report);
         report.AppendLine("输出目录：" + root);
         return report.ToString();
+    }
+
+    private static void VerifyDispatchWindow(StringBuilder report)
+    {
+        long second = 0;
+        var metrics = new BusinessMetrics(() => second);
+        metrics.DispatchUv(); metrics.DispatchUv();
+        Expect(metrics.Snapshot.DispatchesPerMinute == 2, "actual startup dispatch count");
+        second = 59; metrics.DispatchUv();
+        Expect(metrics.Snapshot.DispatchesPerMinute == 3, "window retains recent dispatches");
+        second = 60;
+        Expect(metrics.Snapshot.DispatchesPerMinute == 1 && metrics.Snapshot.DispatchedUvs == 3, "old dispatches expire independently of cumulative total");
+        second = 120;
+        Expect(metrics.Snapshot.DispatchesPerMinute == 0, "idle dispatch rate returns to zero");
+        metrics.DispatchUv(); metrics.Reset();
+        Expect(metrics.Snapshot.DispatchesPerMinute == 0 && metrics.Snapshot.DispatchedUvs == 0, "restart resets dispatch window and totals");
+        report.AppendLine("PASS 每分钟UV投递：实际启动量、60秒窗口到期、空闲归零、累计隔离及新轮次重置");
+    }
+
+    private static async Task VerifySetupTimeoutAsync(StringBuilder report)
+    {
+        using var launches = new BrowserLaunchLimiter(1, 0);
+        var stalled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var aborted = false;
+        var nextStarted = false;
+        var first = launches.ExecuteAsync(() => BusinessUvBrowserRunner.RunSetupAsync(_ =>
+        {
+            entered.SetResult();
+            return stalled.Task; // 模拟浏览器API不响应取消。
+        }, 1, () => "cdp", () => aborted = true, CancellationToken.None), CancellationToken.None);
+        await entered.Task;
+        var next = launches.ExecuteAsync(() => { nextStarted = true; Expect(aborted, "abort before next launch"); return Task.CompletedTask; }, CancellationToken.None);
+        await Task.Delay(100);
+        Expect(!nextStarted, "launch slot remains held until page setup ends");
+        try { await first.WaitAsync(TimeSpan.FromSeconds(3)); throw new InvalidOperationException("准备没有超时。"); }
+        catch (TimeoutException ex) { Expect(ex.Message.Contains("cdp"), "timeout identifies stalled stage"); }
+        await next.WaitAsync(TimeSpan.FromSeconds(2));
+        stalled.SetException(new IOException("迟到的浏览器API异常"));
+        using var stop = new CancellationTokenSource();
+        var cancel = BusinessUvBrowserRunner.RunSetupAsync(_ => Task.Delay(Timeout.Infinite, stop.Token),
+            20, () => "page", () => { }, stop.Token);
+        stop.Cancel();
+        try { await cancel; throw new InvalidOperationException("外部取消未生效。"); }
+        catch (OperationCanceledException) { }
+        report.AppendLine("PASS 页面准备期间占用启动名额；无响应API独立超时并先终止浏览器再放行下一启动，标明卡点；外部取消保留取消分类");
+    }
+
+    private static async Task VerifySharedPoolAsync(StringBuilder report)
+    {
+        SystemPressureSample pressure = Healthy;
+        var metrics = new BusinessMetrics();
+        metrics.BrowserMemory(8UL << 30); // 历史异常峰值不能把24并发压缩为1。
+        var messages = new List<string>();
+        using var pool = new TaskCapacityAdmission(24, metrics, () => pressure, (_, reason) => messages.Add(reason));
+        var options = new TrafficVistaOptions { MaxConcurrency = 24, UvExecutionInterval = 1000 };
+        using var first = await pool.ReserveAsync(new(12, 1, 0, 0, 0), options, CancellationToken.None);
+        await first.AcquireUvAsync(CancellationToken.None);
+        using var second = await pool.ReserveAsync(new(12, 1, 0, 0, 0), options, CancellationToken.None);
+        await second.AcquireUvAsync(CancellationToken.None);
+        for (var i = 1; i < 12; i++)
+        {
+            await first.AcquireUvAsync(CancellationToken.None);
+            await second.AcquireUvAsync(CancellationToken.None);
+        }
+        Expect(pool.Snapshot.ReservedSlots == 24 && first.Slots == 12 && second.Slots == 12,
+            "two tasks fill configured concurrency despite historical memory peak and pending UVs");
+        using (var stop = new CancellationTokenSource(80))
+        {
+            try { await first.AcquireUvAsync(stop.Token); throw new InvalidOperationException("UV超过全局并发。"); }
+            catch (OperationCanceledException) { }
+        }
+        var time = Stopwatch.StartNew();
+        await first.StartUvAsync(200, CancellationToken.None);
+        await first.RecordDispatchedAsync();
+        await second.StartUvAsync(200, CancellationToken.None);
+        await second.RecordDispatchedAsync();
+        Expect(time.Elapsed < TimeSpan.FromMilliseconds(150), "task intervals must not throttle each other");
+        await Task.WhenAll(first.StartUvAsync(200, CancellationToken.None), second.StartUvAsync(200, CancellationToken.None));
+        Expect(time.Elapsed >= TimeSpan.FromMilliseconds(180), "each task retains its own interval");
+        pressure = Healthy with { CpuPercent = 99 };
+        using var cancel = new CancellationTokenSource();
+        var fetch = pool.WaitForFetchAsync(cancel.Token);
+        await Task.Delay(100);
+        Expect(!fetch.IsCompleted && messages.Count == 1, "resource pressure pauses new fetching and reports once");
+        first.ReleaseUv();
+        await first.AcquireUvAsync(CancellationToken.None);
+        Expect(pool.Snapshot.ReservedSlots == 24, "existing work continues under pressure");
+        pressure = Healthy;
+        await fetch.WaitAsync(TimeSpan.FromSeconds(2));
+        Expect(messages.Count == 2, "resource recovery is reported");
+        for (var i = 0; i < 12; i++)
+        {
+            first.Dispatched(); second.Dispatched();
+            first.ReleaseUv(); second.ReleaseUv();
+        }
+        Expect(pool.Snapshot.ReservedSlots == 0 && pool.Snapshot.PendingUvs == 0, "all global permits released");
+        Expect(TaskCapacityAdmission.EstimateCompletionMs(12, 12, 30000, 1000) == 41000,
+            "12 overlapping UVs at 1 second interval and 30 seconds duration take 41 seconds ideally");
+        report.AppendLine("PASS 两项12UV任务填满24并发，历史内存峰值不缩减名额；任务间隔独立、并发硬上限、取消和释放；承压仅暂停新取任务并输出恢复信息；12UV理想41秒");
+    }
+
+    private static async Task VerifyLaunchPacingAsync(StringBuilder report)
+    {
+        using var limiter = new BrowserLaunchLimiter(2, 80);
+        var starts = new System.Collections.Concurrent.ConcurrentQueue<long>();
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => limiter.ExecuteAsync(async () =>
+        {
+            starts.Enqueue(Stopwatch.GetTimestamp());
+            await Task.Delay(150);
+        }, CancellationToken.None)));
+        var ordered = starts.Order().ToArray();
+        Expect(limiter.PeakConcurrentStarts <= 2 && ordered.Zip(ordered.Skip(1))
+            .All(pair => Stopwatch.GetElapsedTime(pair.First, pair.Second).TotalMilliseconds >= 70),
+            "browser startup concurrency and pacing apply across all tasks");
+        report.AppendLine("PASS 浏览器独立启动限速：最多2个同时启动、连续启动间隔80ms；不限制已启动浏览器的运行数量");
+    }
+
+    private static async Task VerifyRuntimeHiddenModeAsync(string root, ILogger logger, StringBuilder report)
+    {
+        var runner = new ControlledRunner();
+        var metrics = new BusinessMetrics();
+        using var consumer = new BrowserTaskConsumer(new Devices(), new CountingProxy(), runner,
+            new BusinessOptions { SessionRoot = Path.Combine(root, "runtime-hidden") }, logger, metrics, () => Healthy);
+        consumer.Configure(new() { MaxConcurrency = 1, UvExecutionInterval = 0, IsHiddenMode = false });
+        var first = consumer.ConsumeAsync(TaskFor(4000, 2), CancellationToken.None).AsTask();
+        await UntilAsync(() => runner.Started == 1);
+        consumer.UpdateHiddenMode(true);
+        var next = consumer.ConsumeAsync(TaskFor(4001, 1), CancellationToken.None).AsTask();
+        runner.AllowFinish.TrySetResult();
+        Expect(await first && await next, "hidden mode update must not reset reservations or interrupt tasks");
+        Expect(runner.Modes.Where(value => value.TaskId == 4000).Count() == 2
+            && runner.Modes.Where(value => value.TaskId == 4000).All(value => !value.Hidden)
+            && runner.Modes.Single(value => value.TaskId == 4001).Hidden,
+            "active task keeps its mode while waiting task gets latest hidden mode");
+        consumer.UpdateHiddenMode(false);
+        Expect(await consumer.ConsumeAsync(TaskFor(4002, 1), CancellationToken.None)
+            && !runner.Modes.Single(value => value.TaskId == 4002).Hidden, "runtime hidden mode switches back");
+        Expect(consumer.Admission.ReservedSlots == 0 && consumer.ActiveUvCount == 0, "runtime update releases all UV reservations");
+        var totals = metrics.Snapshot;
+        Expect(totals.PlannedUvs == 4 && totals.DispatchedUvs == 4 && totals.FinishedUvs == 4
+            && totals.UndispatchedUvs == 0 && totals.ActiveStages.Count == 0, "UV totals and tracked stages reconcile");
+        using (metrics.Track("诊断测试"))
+            Expect(metrics.Snapshot.ActiveStages["诊断测试"].Count == 1, "active stage snapshot");
+        Expect(metrics.Snapshot.ActiveStages.Count == 0, "stage disposal clears active waits");
+        metrics.Reset();
+        Expect(metrics.Snapshot.DispatchedUvs == 0 && metrics.Snapshot.PlannedUvs == 0, "new run resets totals");
+        report.AppendLine("PASS 运行中切换隐藏模式：当前任务的后续UV保持原模式，下一任务采用最新值，可切换回可见；不重建准入或打断任务");
     }
 
     private static async Task VerifyManyWorkersAsync(string root, ILogger logger, StringBuilder report)
@@ -52,110 +202,13 @@ internal static class TaskAdmissionIntegrationTest
                 && runner.Peak == 2 && proxies.Calls == 2, "50 Workers do not bypass two UV lanes or acquire extra IPs");
             Volatile.Write(ref pressure, Healthy with { CpuPercent = 99 });
             runner.AllowFinish.TrySetResult();
-            await UntilAsync(() => consumer.ActiveUvCount == 0 && scheduler.Snapshot.Preparing == 50);
-            Expect(proxies.Calls == 2 && consumer.Admission.ReservedSlots == 0, "CPU pressure blocks all waiting Workers after current UVs finish");
+            await scheduler.Completion.WaitAsync(TimeSpan.FromSeconds(8));
+            Expect(proxies.Calls == 54 && runner.Peak <= 2 && consumer.ActiveUvCount == 0,
+                "already fetched tasks continue under pressure while global UV concurrency stays at two");
         }
         finally { runner.AllowFinish.TrySetResult(); await scheduler.StopAsync(); }
         Expect(consumer.Admission.WaitingTasks == 0 && consumer.Admission.ReservedSlots == 0, "many canceled Workers release all preparation tickets");
-        report.AppendLine("PASS 50任务Worker实际启动：UV峰值仍为2，其他48个等待且不提前领IP；CPU承压后50个等待，停止释放全部名额");
-    }
-
-    private static async Task VerifyReservationsAsync(StringBuilder report)
-    {
-        SystemPressureSample pressure = Healthy with { CpuPercent = 95 };
-        var metrics = new BusinessMetrics();
-        using var gate = new TaskCapacityAdmission(4, metrics, () => Volatile.Read(ref pressure));
-        var options = new TrafficVistaOptions { MaxConcurrency = 4, UvExecutionInterval = 2000, IsProxyMode = true, IpTtl = 120 };
-        var plan = new UvCapacityPlan(20, 1, 0, 0, 0);
-        Expect(TaskCapacityAdmission.EstimateCompletionMs(1, 1, 6000, 60000) == 6000
-            && TaskCapacityAdmission.EstimateCompletionMs(20, 4, 6000, 2000) == 44000,
-            "completion estimate excludes the first cadence window already waited before IP acquisition");
-        var pending = gate.ReserveAsync(plan, options, CancellationToken.None);
-        await UntilAsync(() => gate.Snapshot.WaitingTasks == 1);
-        Expect(!pending.IsCompleted && gate.Snapshot.ReservedSlots == 0, "CPU pressure prevents admission");
-        Volatile.Write(ref pressure, Healthy with { CpuPercent = 78 });
-        await Task.Delay(300);
-        Expect(!pending.IsCompleted, "CPU recovery hysteresis");
-        Volatile.Write(ref pressure, Healthy);
-        using (var reservation = await pending.WaitAsync(TimeSpan.FromSeconds(5)))
-        {
-            Expect(reservation.Slots == 3, "cadence determines required lanes");
-            using var cancel = new CancellationTokenSource();
-            var next = gate.ReserveAsync(new(1, 1, 0, 0, 0), options, cancel.Token);
-            await UntilAsync(() => gate.Snapshot.WaitingTasks == 1);
-            Expect(!next.IsCompleted, "new IP waits until existing task dispatches all UVs even with spare capacity");
-            cancel.Cancel();
-            try { await next; throw new InvalidOperationException("Canceled waiter acquired a reservation"); }
-            catch (OperationCanceledException) { }
-            Expect(gate.Snapshot.WaitingTasks == 0 && gate.Snapshot.ReservedSlots == 3, "cancel returns unclaimed ticket");
-            Volatile.Write(ref pressure, Healthy with { AvailablePhysicalBytes = 100UL << 20, CpuPercent = 99 });
-            for (var i = 0; i < 20; i++)
-            {
-                await reservation.AcquireUvAsync(CancellationToken.None);
-                reservation.Dispatched(); reservation.ReleaseUv();
-            }
-            Expect(gate.Snapshot.PendingUvs == 0, "existing reservation keeps working under later pressure");
-        }
-        Volatile.Write(ref pressure, Healthy);
-        gate.ObserveUv(plan, TimeSpan.FromSeconds(1), true);
-        using (var learned = await gate.ReserveAsync(plan, options, CancellationToken.None))
-        {
-            Expect(learned.Slots == 1 && learned.EstimatedUvMs == 1200, "successful UV timings automatically calibrate overhead");
-            for (var i = 0; i < 4; i++) await learned.AcquireUvAsync(CancellationToken.None);
-            Expect(learned.Slots == 4 && gate.Snapshot.ReservedSlots == 4, "underestimated UVs borrow idle capacity without exceeding hard limit");
-            using var blocked = new CancellationTokenSource(80);
-            try { await learned.AcquireUvAsync(blocked.Token); throw new InvalidOperationException("Expanded reservation exceeded hard limit"); }
-            catch (OperationCanceledException) { }
-            for (var i = 0; i < 4; i++) learned.ReleaseUv();
-        }
-        using (var longPlan = await gate.ReserveAsync(new(100, 1000, 86400, 86400, 86400), options, CancellationToken.None))
-            Expect(longPlan.Slots == 4 && longPlan.DeadlineAtRisk, "large plans do not overflow or wait forever for impossible TTL");
-        metrics.BrowserMemory(2UL << 30);
-        Volatile.Write(ref pressure, Healthy with { AvailablePhysicalBytes = 6UL << 30 });
-        using (var memoryLimited = await gate.ReserveAsync(new(20, 1, 0, 0, 0), options with { UvExecutionInterval = 0 }, CancellationToken.None))
-            Expect(memoryLimited.Slots == 1, "observed browser memory automatically reduces admission slots");
-        Volatile.Write(ref pressure, Healthy with { Available = false });
-        using (var stop = new CancellationTokenSource(350))
-        {
-            try { await gate.ReserveAsync(plan, options, stop.Token); throw new InvalidOperationException("Missing resource sample admitted work"); }
-            catch (OperationCanceledException) { }
-            Expect(gate.Snapshot.Reason.Contains("采样失败") && !gate.HasReservations, "probe failure is visible and does not leak reservations");
-        }
-        report.AppendLine("PASS 自动耗时/内存估算、CPU恢复滞回、大UV计划、预留名额不被新IP抢占、压力升高后继续投递、取消及采样故障");
-    }
-
-    private static async Task VerifyIpPriorityAsync(string root, ILogger logger, StringBuilder report)
-    {
-        SystemPressureSample pressure = Healthy;
-        var proxies = new CountingProxy(); var runner = new ControlledRunner(); var devices = new Devices();
-        using var consumer = new BrowserTaskConsumer(devices, proxies, runner,
-            new BusinessOptions { SessionRoot = Path.Combine(root, "priority") }, logger, new(), () => Volatile.Read(ref pressure));
-        consumer.Configure(new() { MaxConcurrency = 2, UvExecutionInterval = 30, IsProxyMode = true, IpTtl = 60 });
-        var first = consumer.ConsumeAsync(TaskFor(101, 20), CancellationToken.None).AsTask();
-        await UntilAsync(() => runner.Started >= 2);
-        Volatile.Write(ref pressure, Healthy with { CpuPercent = 95, AvailablePhysicalBytes = 100UL << 20 });
-        using var stop = new CancellationTokenSource();
-        var second = consumer.ConsumeAsync(TaskFor(102, 1), stop.Token).AsTask();
-        try
-        {
-        await UntilAsync(() => consumer.Admission.WaitingTasks == 1);
-        Expect(proxies.Calls == 1, "no second IP while pressure or existing UV dispatch backlog");
-        runner.AllowFinish.TrySetResult();
-        Expect(await first.WaitAsync(TimeSpan.FromSeconds(8)), "IP-owning task finishes all 20 UVs under pressure");
-        Expect(runner.Started == 20 && runner.Peak <= 2 && consumer.ActiveUvCount == 0, "hard limit includes complete UV lifecycle");
-        var times = devices.Starts.Order().ToArray();
-        Expect(times.Zip(times.Skip(1), (a, b) => Stopwatch.GetElapsedTime(a, b).TotalMilliseconds).All(ms => ms >= 25), "global UV interval preserved");
-        Expect(!second.IsCompleted && proxies.Calls == 1, "new task still waits before IP acquisition");
-        Volatile.Write(ref pressure, Healthy);
-        Expect(await second.WaitAsync(TimeSpan.FromSeconds(5)) && proxies.Calls == 2, "recovered pressure allows next IP");
-        Expect(consumer.Admission.ReservedSlots == 0 && consumer.Admission.WaitingTasks == 0, "task completion releases all reservations");
-        }
-        finally
-        {
-            stop.Cancel(); runner.AllowFinish.TrySetResult();
-            try { await second; } catch (OperationCanceledException) { }
-        }
-        report.AppendLine("PASS 真实消费者：20 UV任务领IP后承压仍按间隔投递，新任务不提前领IP，峰值并发不超过2，恢复后继续");
+        report.AppendLine("PASS 50任务Worker共享2个UV名额，不提前领超出名额的IP；已经取回的54项任务在后续承压时继续完成，停止不漏名额");
     }
 
     private static async Task VerifyPendingRecoveryAsync(string root, ILogger logger, StringBuilder report)
@@ -165,6 +218,7 @@ internal static class TaskAdmissionIntegrationTest
         using var consumer = new BrowserTaskConsumer(new Devices(), proxies, new InstantRunner(),
             new BusinessOptions { SessionRoot = Path.Combine(root, "pending") }, logger, new(), () => pressure);
         consumer.Configure(new() { MaxConcurrency = 1, UvExecutionInterval = 0 });
+        await using var held = await consumer.PrepareAsync(TaskFor(200, 1), CancellationToken.None);
         var task = TaskFor(201, 20);
         var cache = new LocalTaskCacheOptions { FilePath = Path.Combine(root, "pending.json"), LoadOnStart = true };
         var fetched = 0;
@@ -180,34 +234,7 @@ internal static class TaskAdmissionIntegrationTest
         }
         await using (var restored = await LocalTaskCache<TaskEnvelope>.OpenAsync(cache, item => item.DeliveryId))
             Expect(restored.ReplayItems().Single().DeliveryId == task.DeliveryId, "admission-waiting task survives cancellation and restart");
-        report.AppendLine("PASS 准备阶段先等待资源，再落盘消费确认；等待中停止不领取IP，任务可恢复");
-    }
-
-    private static async Task VerifyFirstLaunchWindowAsync(string root, ILogger logger, StringBuilder report)
-    {
-        var proxies = new CountingProxy(); var devices = new Devices();
-        using var consumer = new BrowserTaskConsumer(devices, proxies, new InstantRunner(),
-            new BusinessOptions { SessionRoot = Path.Combine(root, "first-window") }, logger, new(), () => Healthy);
-        consumer.Configure(new() { MaxConcurrency = 2, UvExecutionInterval = 500, IsProxyMode = true });
-        Expect(await consumer.ConsumeAsync(TaskFor(301, 1), CancellationToken.None), "first task completed");
-        using var stop = new CancellationTokenSource();
-        var waiting = consumer.ConsumeAsync(TaskFor(302, 1), stop.Token).AsTask();
-        await Task.Delay(100);
-        Expect(proxies.Calls == 1 && !waiting.IsCompleted, "first launch interval waits before new IP acquisition");
-        stop.Cancel();
-        try { await waiting; throw new InvalidOperationException("Canceled first launch window executed"); }
-        catch (OperationCanceledException) { }
-        Expect(consumer.Admission.ReservedSlots == 0 && proxies.Calls == 1, "first-window cancellation releases reservation without consuming IP");
-        Expect(await consumer.ConsumeAsync(TaskFor(303, 1), CancellationToken.None) && proxies.Calls == 2, "next window resumes");
-        var starts = devices.Starts.Order().ToArray();
-        Expect(Stopwatch.GetElapsedTime(starts[0], starts[1]) >= TimeSpan.FromMilliseconds(450), "cross-task first-UV interval");
-        using var probe = new SystemPressureProbe();
-        Expect(!probe.Read().Available, "native CPU sample needs a baseline");
-        await Task.Delay(1050);
-        var native = probe.Read();
-        Expect(native.Available && native.CpuPercent is >= 0 and <= 100 && native.TotalPhysicalBytes > 0,
-            "native memory and differential CPU sampling");
-        report.AppendLine("PASS 首个UV全局间隔也在领IP前等待，等待取消不消耗IP；Windows CPU差分及内存采样");
+        report.AppendLine("PASS 首UV并发名额等待发生在落盘消费确认前；等待中停止不领取IP，任务可恢复");
     }
 
     private static async Task VerifyFetchWaitAsync(StringBuilder report)
@@ -271,11 +298,13 @@ internal static class TaskAdmissionIntegrationTest
     { public Task<bool> RunAsync(BusinessUvRun run, CancellationToken token) => Task.FromResult(true); }
     private sealed class ControlledRunner : IBusinessUvRunner
     {
+        internal readonly System.Collections.Concurrent.ConcurrentQueue<(long TaskId, bool Hidden)> Modes = new();
         internal readonly TaskCompletionSource AllowFinish = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal readonly System.Collections.Concurrent.ConcurrentQueue<long> Starts = new();
         private int _active; internal int Started, Peak;
         public async Task<bool> RunAsync(BusinessUvRun run, CancellationToken token)
         {
+            Modes.Enqueue((run.TaskId, run.Options.IsHiddenMode));
             Starts.Enqueue(Stopwatch.GetTimestamp()); Interlocked.Increment(ref Started);
             var active = Interlocked.Increment(ref _active);
             int peak; do { peak = Peak; if (peak >= active) break; } while (Interlocked.CompareExchange(ref Peak, active, peak) != peak);

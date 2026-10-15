@@ -1,0 +1,6 @@
+并发 1: 8 UV，21.40s，22.4 UV/min，P95=4517ms，峰值浏览器=1
+并发 2: 8 UV，19.10s，25.1 UV/min，P95=6171ms，峰值浏览器=2
+并发 4: 8 UV，16.07s，29.9 UV/min，P95=8810ms，峰值浏览器=4
+并发 8: 8 UV，15.44s，31.1 UV/min，P95=15268ms，峰值浏览器=7
+本地零停留页面；主进程内存为工作集，PeakSessionBrowserCommittedMiB 为单 UV 整个 Chrome Job 的峰值提交内存，均不代表全机总内存。不能外推真实网络吞吐。
+输出目录：F:\codex\TrafficVista\src\Build\demo-output\benchmark\91c62dfec2ca4d5ebe252ee4c8b4d203

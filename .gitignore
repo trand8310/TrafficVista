@@ -1,0 +1,9 @@
+.audit-build/
+src/Build/
+**/bin/
+**/obj/
+**/appsettings.user.json
+**/appsettings.private.json
+*.csproj.user
+*.Backup.tmp
+.vs/

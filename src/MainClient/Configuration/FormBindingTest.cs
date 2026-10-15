@@ -104,6 +104,16 @@ internal static class FormBindingTest
                 while (!scheduler.IsRunning && wait.Elapsed < TimeSpan.FromSeconds(5))
                 { Application.DoEvents(); Thread.Sleep(10); }
                 if (!scheduler.IsRunning) throw new InvalidOperationException("--auto-start 未触发按钮启动逻辑。");
+                var hidden = (CheckBox)automatic.Controls.Find("checkBox_IsHiddenMode", true).Single();
+                if (!hidden.Enabled) throw new InvalidOperationException("运行中隐藏模式控件被禁用。");
+                hidden.Checked = true;
+                automatic.SaveUiSettings();
+                if (!scheduler.IsRunning || !new TrafficVistaSettings(directory).Value.IsHiddenMode)
+                    throw new InvalidOperationException("运行中隐藏模式切换未保存，或中断调度。");
+                hidden.Checked = false;
+                automatic.SaveUiSettings();
+                if (!scheduler.IsRunning || new TrafficVistaSettings(directory).Value.IsHiddenMode)
+                    throw new InvalidOperationException("运行中隐藏模式无法切回可见。");
                 scheduler.StopAsync().GetAwaiter().GetResult();
                 automatic.Hide();
                 automatic.Show();

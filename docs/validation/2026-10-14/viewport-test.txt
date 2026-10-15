@@ -1,0 +1,7 @@
+PASS
+Samsung SM-G991B 输入=1080x2400 → Physical=1080x2400, CSS=411x914, DPR=2.625, DprX=2.6277, DprY=2.6258, Score=0.095545, Suspicious=False, Fallback=False
+Honor AMG-AN00 输入=720x1600 → Physical=720x1600, CSS=360x800, DPR=2.000, DprX=2.0000, DprY=2.0000, Score=0.000000, Suspicious=False, Fallback=False
+OnePlus NE2210 输入=1440x3216 → Physical=1440x3216, CSS=411x919, DPR=3.500, DprX=3.5036, DprY=3.4995, Score=0.180329, Suspicious=False, Fallback=False
+Samsung SM-G991B 输入=2400x1080 → Physical=1080x2400, CSS=411x914, DPR=2.625, DprX=2.6277, DprY=2.6258, Score=0.095545, Suspicious=False, Fallback=False
+Test Fallback 输入=500x500 → Physical=500x500, CSS=286x286, DPR=1.750, DprX=1.7483, DprY=1.7483, Score=9999.000000, Suspicious=True, Fallback=True
+Chrome启动参数、Context viewport/screen/DPR、稳定性、横向输入归一化及回退标记验证通过。

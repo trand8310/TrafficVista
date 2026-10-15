@@ -27,6 +27,7 @@ public partial class MainForm : Form
     private string? _transitionText;
     internal bool AutoStartRequested { get; set; }
     private bool _autoStartHandled;
+    private SchedulingDiagnosticsForm? _diagnosticsForm;
     internal DesktopStatusSnapshot DesktopStatus => _desktopMonitor.Snapshot;
 
     public MainForm(ILogger logger, TaskSchedulingService scheduler, TrafficVistaSettings settings)
@@ -54,9 +55,14 @@ public partial class MainForm : Form
         linkLabel2.LinkClicked += linkLabel2_LinkClicked;
         statusStrip1.ShowItemToolTips = true;
         _statusToolTip = new ToolTip(components!) { AutoPopDelay = 20000 };
+        label_Status.DoubleClick += (_, _) => OpenDiagnostics();
+        var diagnosticsMenu = new ContextMenuStrip(components!);
+        diagnosticsMenu.Items.Add("本轮累计统计 / 调度诊断", null, (_, _) => OpenDiagnostics());
+        label_Status.ContextMenuStrip = diagnosticsMenu;
         _statusToolTip.SetToolTip(checkBox_RealIp, "代理模式优先使用供应商真实出口IP，缺失时查询；直连模式查询本机出口IP，并传给浏览器环境。");
         _statusToolTip.SetToolTip(checkBox_IpDetails, "通过当前网络通道竞速查询完整IP详情，并设置有效时区和定位；代理查询全部失败则换新IP，直连查询失败则记日志并结束本任务。");
-        _statusToolTip.SetToolTip(numericUpDown_TaskWorkers, "任务工作协程数量（1～1024），启动时生效；可以按CPU核心数设置。UV/浏览器数量仍由并发数和资源准入限制，Worker等待时不占浏览器。");
+        _statusToolTip.SetToolTip(numericUpDown_TaskWorkers, "任务工作协程数量；多任务共用设定的UV并发池，每项任务按自己的UV间隔投递。Worker等待时不占浏览器。");
+        _statusToolTip.SetToolTip(checkBox_IsHiddenMode, "启动或运行中可修改；后续开始执行的任务使用最新模式，当前任务及其剩余UV保持原模式。");
         ApplyUiSettings(settings.Value);
         foreach (var control in ConfigurationControls)
         {
@@ -149,6 +155,12 @@ public partial class MainForm : Form
         saveSettingsTimer.Stop();
         saveSettingsTimer.Start();
         AppLogging.SetVerbose(checkBox_VerboseLog.Checked);
+        if (ReferenceEquals(sender, checkBox_IsHiddenMode))
+        {
+            _scheduler.UpdateHiddenMode(checkBox_IsHiddenMode.Checked);
+            if (_scheduler.IsRunning || _busy)
+                _logger.Information("隐藏模式已修改为{Hidden}，后续开始执行的任务生效", checkBox_IsHiddenMode.Checked);
+        }
     }
 
     internal void SaveUiSettings()
@@ -164,7 +176,21 @@ public partial class MainForm : Form
     {
         _busy = busy;
         btnStartStop.Enabled = !busy && !_closing;
-        foreach (var control in ConfigurationControls) control.Enabled = !busy && !_closing && !_scheduler.IsRunning;
+        foreach (var control in ConfigurationControls)
+        {
+            if (control is TextBox text)
+            {
+                text.ReadOnly = !(!busy && !_closing && !_scheduler.IsRunning);
+            }
+            else if (control is NumericUpDown number)
+            {
+                number.ReadOnly = !(!busy && !_closing && !_scheduler.IsRunning);
+            }
+            else if (ReferenceEquals(control, checkBox_IsHiddenMode))
+                control.Enabled = !_closing;
+            else
+                control.Enabled = !busy && !_closing && !_scheduler.IsRunning;
+        }
         btnStartStop.Text = _scheduler.IsRunning ? "停止" : "启动";
         RefreshApplicationState();
     }
@@ -214,7 +240,7 @@ public partial class MainForm : Form
         var currentError = s.CacheError ?? s.LastError;
         label_Status.Text = BuildTaskStatusText(s, p, _scheduler.ActiveUvSessions, admission, currentError);
         var pressureDetails = admission is null ? "" : $"CPU趋势：{admission.CpuPercent:F1}%，可用物理内存：{admission.AvailableMemoryMiB:F0} MiB，新任务内存名额：{admission.MemoryCapacity}";
-        _statusToolTip.SetToolTip(label_Status, pressureDetails + (currentError is null ? "" : "\n" + currentError));
+        _statusToolTip.SetToolTip(label_Status, "双击或右键查看累计统计、当前阶段及等待时长。\n" + pressureDetails + (currentError is null ? "" : "\n" + currentError));
         SetBusy(_busy);
     }
 
@@ -222,12 +248,42 @@ public partial class MainForm : Form
         TaskAdmissionSnapshot? admission, string? error)
     {
         static string Short(string value, int length) => value.Length <= length ? value : value[..length] + "…";
-        var text = $"任务：提交{s.Submitted} 排队{s.Queued} 执行{s.Running}\n成{s.Succeeded} 败{s.Failed} 取消{s.Canceled} 待恢复{s.Cached}"
-            + $"\nUV：运行{active} 成/败/取消 {p.SucceededUvs}/{p.FailedUvs}/{p.CanceledUvs}"
-            + $"\n吞吐{p.UvsPerMinute:F1}/分 P95 {p.UvP95Ms / 1000:F1}s";
-        if (admission is not null) text += $"\n准入：{Short(admission.Reason, 22)}\n预留{admission.ReservedSlots} 等待{admission.WaitingTasks} 待投递UV{admission.PendingUvs}";
+        var text = $"UV投递 / 分（最近60秒）：{p.DispatchesPerMinute:F0}"
+            + $"\nUV完成 / 分（本轮平均）：{p.AttemptsPerMinute:F1}"
+            + $"\nUV成功 / 分（本轮平均）：{p.UvsPerMinute:F1}"
+            + $"\nUV耗时 P95：{p.UvP95Ms / 1000:F1}秒"
+            + $"\nUV累计投递：{p.DispatchedUvs}"
+            + $"\nUV累计完成：{p.FinishedUvs}"
+            + $"\nUV运行中：{active}"
+            + $"\nUV成功：{p.SucceededUvs}"
+            + $"\nUV失败：{p.FailedUvs}"
+            + $"\nUV取消：{p.CanceledUvs}"
+            + $"\n任务累计提交：{s.Submitted}"
+            + $"\n任务排队：{s.Queued}"
+            + $"\n任务等待执行：{s.Preparing}"
+            + $"\n任务执行中：{s.Running}"
+            + $"\n任务成功：{s.Succeeded}"
+            + $"\n任务失败：{s.Failed}"
+            + $"\n任务取消：{s.Canceled}"
+            + $"\n任务待恢复：{s.Cached}";
+        if (admission is not null) text += $"\n取任务：{Short(admission.Reason, 16)}"
+            + $"\nUV名额占用：{admission.ReservedSlots}"
+            + $"\n等待名额的任务：{admission.WaitingTasks}"
+            + $"\n待投递UV：{admission.PendingUvs}";
+        var slow = p.ActiveStages.OrderByDescending(item => item.Value.OldestSeconds).FirstOrDefault();
+        if (slow.Key is not null) text += $"\n最慢阶段：{Short(slow.Key, 12)}"
+            + $"\n该阶段数量：{slow.Value.Count}"
+            + $"\n该阶段最久耗时：{slow.Value.OldestSeconds:F0}秒";
         if (error is not null) text += "\n错误：" + Short(error.Split('\n')[0].Trim(), 22);
         return text;
+    }
+
+    private void OpenDiagnostics()
+    {
+        if (_diagnosticsForm is { IsDisposed: false }) { _diagnosticsForm.Activate(); return; }
+        _diagnosticsForm = new SchedulingDiagnosticsForm(_scheduler);
+        _diagnosticsForm.FormClosed += (_, _) => _diagnosticsForm = null;
+        _diagnosticsForm.Show(this);
     }
 
     private async void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
@@ -339,7 +395,7 @@ public partial class MainForm : Form
             try
             {
                 await Task.Run(() => Process.Start(new ProcessStartInfo(Path.GetDirectoryName(_startupShortcut.ShortcutPath)!)
-                    { UseShellExecute = true, Verb = "open" })?.Dispose());
+                { UseShellExecute = true, Verb = "open" })?.Dispose());
             }
             catch (Exception ex)
             {

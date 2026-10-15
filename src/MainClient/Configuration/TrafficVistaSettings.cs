@@ -18,6 +18,7 @@ public sealed class TrafficVistaSettings : IOptions<TrafficVistaOptions>
     public string UserFilePath { get; }
     public SchedulerOptions SchedulingDefaults { get; }
     public int MaxConcurrentBrowserStarts { get; }
+    public int BrowserStartIntervalMilliseconds { get; }
     public LocalTestingOptions LocalTesting { get; }
     public BusinessOptions Business { get; }
     /// <summary>Net 模块配置；供应商默认值取基础文件，用户文件可覆盖所选供应商与 URL 等。</summary>
@@ -55,6 +56,10 @@ public sealed class TrafficVistaSettings : IOptions<TrafficVistaOptions>
             .GetValue("MaxConcurrentStarts", StringComparison.OrdinalIgnoreCase)?.ToObject<int>()
             ?? ChromeStartup.MaxConcurrentStarts;
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(MaxConcurrentBrowserStarts);
+        BrowserStartIntervalMilliseconds = GetSection(defaults, "Browser")?
+            .GetValue("StartIntervalMilliseconds", StringComparison.OrdinalIgnoreCase)?.ToObject<int>() ?? 100;
+        if (BrowserStartIntervalMilliseconds is < 0 or > 60000)
+            throw new InvalidDataException("Browser:StartIntervalMilliseconds 必须在0～60000毫秒之间。");
         var merged = (JObject?)GetSection(defaults, TrafficVistaOptions.SectionName)?.DeepClone() ?? new JObject();
         var netMerged = (JObject?)GetSection(defaults, NetOptions.SectionName)?.DeepClone() ?? new JObject();
         if (File.Exists(UserFilePath))
@@ -100,13 +105,13 @@ public sealed class TrafficVistaSettings : IOptions<TrafficVistaOptions>
             PollInterval = TimeSpan.FromMilliseconds(uiOptions.TaskFetchInterval),
             EmptyPollInterval = TimeSpan.FromMilliseconds(uiOptions.TaskFetchInterval),
             CompleteWhenSourceEmpty = false,
-            LocalCache = Business.PersistPendingTasks ? new Scheduling.Persistence.LocalTaskCacheOptions
+            LocalCache = Business.TaskRecoveryMode == TaskRecoveryMode.Save ? new Scheduling.Persistence.LocalTaskCacheOptions
             {
                 FilePath = Path.Combine(Path.GetDirectoryName(UserFilePath)!, "business", "pending",
                     Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
                         Encoding.UTF8.GetBytes(uiOptions.TaskApiUrl + "\n" + uiOptions.TaskName))) + ".json"),
                 LoadOnStart = true, CompactClaimsWhenEmpty = true
-            } : SchedulingDefaults.LocalCache
+            } : null
         };
     }
 

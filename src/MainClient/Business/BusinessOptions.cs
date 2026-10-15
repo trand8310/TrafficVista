@@ -1,5 +1,7 @@
 namespace TrafficVista.Business;
 
+public enum TaskRecoveryMode { Discard, Save }
+
 /// <summary>业务消费者固定配置，从 appsettings.json 的 Business 节读取，界面不修改。</summary>
 public sealed record BusinessOptions
 {
@@ -17,11 +19,18 @@ public sealed record BusinessOptions
     public int SessionMaxMegabytes { get; init; } = 1024;
     public int MaxExpandedBatchTasks { get; init; } = 10000;
     public int MaxExpandedBatchMegabytes { get; init; } = 16;
-    public bool PersistPendingTasks { get; init; } = true;
+    /// <summary>默认只使用内存队列；Save模式保存尚未开始执行的任务供重启恢复。</summary>
+    public TaskRecoveryMode TaskRecoveryMode { get; init; } = TaskRecoveryMode.Discard;
+    /// <summary>显式开启后才导出任务、设备、运行结果及会话快照。</summary>
+    public bool ExportRunData { get; init; } = false;
+    /// <summary>Chrome连接后，Context、页面及环境设置共用的准备超时。</summary>
+    public int BrowserSetupTimeoutSeconds { get; init; } = 20;
     public string ChromeExecutablePath { get; init; } = "File/chrome-win/145.0.7632.110/chrome.exe";
 
     public void Validate()
     {
+        if (!Enum.IsDefined(TaskRecoveryMode)) throw new ArgumentOutOfRangeException(nameof(TaskRecoveryMode));
+        if (BrowserSetupTimeoutSeconds is < 1 or > 120) throw new ArgumentOutOfRangeException(nameof(BrowserSetupTimeoutSeconds));
         if (string.IsNullOrWhiteSpace(SessionRoot)) throw new InvalidOperationException("业务会话目录不能为空。");
         if (string.IsNullOrWhiteSpace(RecoveryRoot)) throw new InvalidOperationException("任务恢复目录不能为空。");
         if (MaxUvPerTask is < 1 or > 1000000) throw new ArgumentOutOfRangeException(nameof(MaxUvPerTask));

@@ -15,15 +15,56 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
     private readonly BusinessMetrics _metrics = metrics ?? new();
     private readonly BusinessOptions _business = business ?? new();
 
-    public async Task<bool> RunAsync(BusinessUvRun run, CancellationToken token)
+    public async Task<bool> RunAsync(BusinessUvRun run, CancellationToken cancellationToken)
     {
+        using var lifetime = new BrowserLifetimeGuard(cancellationToken);
+        var token = lifetime.Token;
         OwnedChromeSession? session = null;
         IBrowserContext? context = null;
+        IPage page = null!;
+        int? latestDocumentStatus = null;
+        string? latestDocumentFailure = null;
+        EventHandler<IResponse> documentResponse = (_, response) =>
+        {
+            if (response.Request.IsNavigationRequest && response.Request.Frame == page.MainFrame)
+            { latestDocumentStatus = response.Status; latestDocumentFailure = null; }
+        };
+        EventHandler<IRequest> documentFailure = (_, request) =>
+        {
+            if (request.IsNavigationRequest && request.Frame == page.MainFrame)
+                latestDocumentFailure = request.Failure;
+        };
         var errors = new List<Exception>();
         var successful = false;
         var actualViews = 0;
         var stage = "launch";
+        IDisposable? activeStage = null;
+        void SetStage(string value)
+        {
+            activeStage?.Dispose();
+            stage = value;
+            var name = value switch
+            {
+                "viewport" => "环境设置",
+                "launch" => "浏览器启动排队",
+                "browserStart" => "浏览器启动",
+                "context" => "会话创建",
+                "page" => "页面创建",
+                "cdp" => "CDP环境设置",
+                "pageInit" => "页面初始化",
+                "navigation" => "页面导航",
+                "pageDelay" => "首次延时",
+                "pageActions" => "页面操作",
+                "dwell" => "停留",
+                "storage" => "导出会话",
+                "contentCheck" => "正文检查",
+                "cacheDrain" => "缓存收尾",
+                _ => value
+            };
+            activeStage = _metrics.Track(name);
+        }
         var stages = new JObject();
+        var navigationWarnings = new List<string>();
         var cacheTasks = new HashSet<Task>();
         var cacheSync = new object();
         var cleanupDeferred = false;
@@ -35,86 +76,145 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
         var started = Stopwatch.GetTimestamp();
         try
         {
-            stage = "viewport";
+            SetStage("viewport");
             viewport = MatchViewport(run.Device);
             ipEnvironment = BrowserIpEnvironment.From(run);
-            await File.WriteAllTextAsync(Path.Combine(run.Directory, "ip-environment.json"),
+            if (_business.ExportRunData) await File.WriteAllTextAsync(Path.Combine(run.Directory, "ip-environment.json"),
                 JObject.FromObject(ipEnvironment).ToString(), token).ConfigureAwait(false);
-            await File.WriteAllTextAsync(Path.Combine(run.Directory, "viewport.json"),
+            if (_business.ExportRunData) await File.WriteAllTextAsync(Path.Combine(run.Directory, "viewport.json"),
                 JObject.FromObject(viewport).ToString(), token).ConfigureAwait(false);
-            logger.Information("UV屏幕匹配，TaskId={TaskId}，UvId={UvId}，Make={Make}，Model={Model}，Physical={PhysicalWidth}x{PhysicalHeight}，CSS={CssWidth}x{CssHeight}，DPR={Dpr}",
+            logger.Information("UV屏幕匹配，TaskId={TaskId}，UvId={UvId}，Make={Make}，Model={Model}，Physical={PhysicalWidth}x{PhysicalHeight}，CSS={CssWidth}x{CssHeight}，DPR={Dpr}，DprSource={DprSource}，Strategy={Strategy}",
                 run.TaskId, run.UvId, run.Device.Make, run.Device.Model, viewport.PhysicalWidth, viewport.PhysicalHeight,
-                viewport.CssWidth, viewport.CssHeight, viewport.DeviceScaleFactor);
+                viewport.CssWidth, viewport.CssHeight, viewport.DeviceScaleFactor, viewport.DprSource, viewport.MatchStrategy);
             if (viewport.IsFallback || viewport.IsSuspiciousInput)
-                logger.Warning("UV屏幕参数匹配存在回退或异常比例，TaskId={TaskId}，UvId={UvId}，Viewport={Viewport}", run.TaskId, run.UvId, viewport);
-            stage = "launch";
+                logger.Warning("UV屏幕映射超出估算覆盖范围，TaskId={TaskId}，UvId={UvId}，Viewport={Viewport}", run.TaskId, run.UvId, viewport);
+            SetStage("launch");
             var timed = Stopwatch.GetTimestamp();
             await launches.ExecuteAsync(async () =>
             {
+                SetStage("browserStart");
                 var launchStarted = Stopwatch.GetTimestamp();
                 stages["launchQueueMs"] = Stopwatch.GetElapsedTime(timed).TotalMilliseconds;
                 _metrics.Stage("launchQueue", Stopwatch.GetElapsedTime(timed));
-                session = await OwnedChromeSession.StartAsync(playwright, CreateLaunchOptions(run, viewport, ipEnvironment), run.Directory, token).ConfigureAwait(false);
+                session = await OwnedChromeSession.StartAsync(playwright, CreateLaunchOptions(run, viewport, ipEnvironment), run.Directory, token,
+                    writeCleanupMarker: _business.ExportRunData).ConfigureAwait(false);
                 _metrics.BrowserOpened();
-                context = await AwaitAsync(session.Browser!.NewContextAsync(CreateContextOptions(run, viewport, ipEnvironment)), token).ConfigureAwait(false);
+                lifetime.Watch(session.Browser!);
+                await RunSetupAsync(async setupToken =>
+                {
+                    SetStage("context");
+                    context = await AwaitAsync(session.Browser!.NewContextAsync(CreateContextOptions(run, viewport, ipEnvironment)), setupToken).ConfigureAwait(false);
+                    lifetime.Watch(context);
+                    SetStage("page");
+                    page = await AwaitAsync(context.NewPageAsync(), setupToken).ConfigureAwait(false);
+
+
+                    lifetime.Watch(page);
+                    page.Response += documentResponse;
+                    page.RequestFailed += documentFailure;
+                    SetStage("cdp");
+                    var cdp = await AwaitAsync(context.NewCDPSessionAsync(page), setupToken).ConfigureAwait(false);
+                    await AwaitAsync(cdp.SendAsync("Network.enable"), setupToken).ConfigureAwait(false);
+                    await AwaitAsync(cdp.SendAsync("Network.setBlockedURLs",
+                        new Dictionary<string, object>
+                        {
+                            ["urls"] = new[]
+                            {
+                                "*.png",
+                                "*.jpg",
+                                "*.jpeg",
+                                "*.webp",
+                                "*.mp4",
+                                "*.webm",
+                                "*.m3u8"
+                            }
+                        }), setupToken).ConfigureAwait(false);
+                    SetStage("pageInit");
+                    page.SetDefaultTimeout(10000);
+                    page.SetDefaultNavigationTimeout(run.Options.PageLoadingTimeout * 1000);
+                    await AwaitAsync(page.AddInitScriptAsync(BuildInitScript(run)), setupToken).ConfigureAwait(false);
+                    var partition = (run.Proxy?.PlaywrightServer ?? "direct") + "\n" + run.Proxy?.IpInfo?.ToString(Newtonsoft.Json.Formatting.None);
+                    if (run.Options.IsCacheMode)
+                    {
+                        page.Response += (_, response) =>
+                        {
+                            if (!cache.TryBeginCapture()) return;
+                            var write = RecordAsync(response, partition, captureStop.Token);
+                            lock (cacheSync)
+                            {
+                                cacheTasks.RemoveWhere(task => task.IsCompleted);
+                                cacheTasks.Add(write);
+                            }
+                        };
+                        await AwaitAsync(page.RouteAsync("**/*", route => ServeAsync(route, partition, token)), setupToken).ConfigureAwait(false);
+                    }
+                }, _business.BrowserSetupTimeoutSeconds, () => stage, session.Abort, token).ConfigureAwait(false);
                 stages["browserStartMs"] = Stopwatch.GetElapsedTime(launchStarted).TotalMilliseconds;
                 _metrics.Stage("browserStart", Stopwatch.GetElapsedTime(launchStarted));
             }, token).ConfigureAwait(false);
             stages["launchMs"] = Stopwatch.GetElapsedTime(timed).TotalMilliseconds;
             _metrics.Stage("launch", Stopwatch.GetElapsedTime(timed));
             token.ThrowIfCancellationRequested();
-            stage = "page";
-            var page = await AwaitAsync(context!.NewPageAsync(), token).ConfigureAwait(false);
-            page.SetDefaultTimeout(10000);
-            page.SetDefaultNavigationTimeout(run.Options.PageLoadingTimeout * 1000);
-            await AwaitAsync(page.AddInitScriptAsync(BuildInitScript(run)), token).ConfigureAwait(false);
-            var partition = (run.Proxy?.PlaywrightServer ?? "direct") + "\n" + run.Proxy?.IpInfo?.ToString(Newtonsoft.Json.Formatting.None);
-            if (run.Options.IsCacheMode)
-            {
-                page.Response += (_, response) =>
-                {
-                    if (!cache.TryBeginCapture()) return;
-                    var write = RecordAsync(response, partition, captureStop.Token);
-                    lock (cacheSync)
-                    {
-                        cacheTasks.RemoveWhere(task => task.IsCompleted);
-                        cacheTasks.Add(write);
-                    }
-                };
-                await page.RouteAsync("**/*", route => ServeAsync(route, partition, token)).ConfigureAwait(false);
-            }
             var navigationMs = 0.0;
             for (var view = 1; view <= run.PageViews; view++)
             {
                 token.ThrowIfCancellationRequested();
-                stage = "navigation";
+                SetStage("navigation");
                 timed = Stopwatch.GetTimestamp();
                 // One UV retains its page, cookies, storage and normal cache across PVs, like a user refreshing.
-                var response = view == 1
-                    ? await AwaitAsync(page.GotoAsync(run.Target.AbsoluteUri,
-                        new() { WaitUntil = WaitUntilState.Load }), token).ConfigureAwait(false)
-                    : await AwaitAsync(page.ReloadAsync(new() { WaitUntil = WaitUntilState.Load }), token).ConfigureAwait(false);
+                if (view == 1)
+                {
+                    var opened = await InitialPageNavigation.OpenAsync(page, run.Target.AbsoluteUri, logger,
+                        run.TaskId, run.UvId, token, run.Options.PageLoadingTimeout).ConfigureAwait(false);
+                    navigationWarnings.AddRange(opened.Warnings);
+                }
+                else
+                {
+                    var response = await AwaitAsync(page.ReloadAsync(new() { WaitUntil = WaitUntilState.Load }), token).ConfigureAwait(false);
+                    if (response is null || !response.Ok)
+                        throw new InvalidOperationException($"页面加载失败：HTTP {response?.Status}（第 {view}/{run.PageViews} 次访问）。");
+                }
                 navigationMs += Stopwatch.GetElapsedTime(timed).TotalMilliseconds;
-                if (response is null || !response.Ok)
-                    throw new InvalidOperationException($"页面加载失败：HTTP {response?.Status}（第 {view}/{run.PageViews} 次访问）。");
                 actualViews++;
-                stage = "pageDelay";
+                SetStage("pageDelay");
                 if (view == 1 && run.Options.PageLoadingDelay > 0)
                     await Task.Delay(TimeSpan.FromSeconds((double)run.Options.PageLoadingDelay), token).ConfigureAwait(false);
-                stage = "pageActions";
+                SetStage("pageActions");
                 await OnPageLoadedAsync(page, run, view, token).ConfigureAwait(false);
-                stage = "dwell";
+                SetStage("dwell");
                 var dwell = run.NextDwell();
                 if (dwell > TimeSpan.Zero) await Task.Delay(dwell, token).ConfigureAwait(false);
             }
             stages["navigationMs"] = navigationMs;
             _metrics.Stage("navigation", TimeSpan.FromMilliseconds(navigationMs));
-            stage = "storage";
-            successful = await AwaitAsync(page.Locator("body").IsVisibleAsync(), token).ConfigureAwait(false);
-            timed = Stopwatch.GetTimestamp();
-            await AwaitAsync(context.StorageStateAsync(new()
-                { Path = Path.Combine(run.Directory, "storage-state.json"), IndexedDB = true }), token).ConfigureAwait(false);
-            stages["storageMs"] = Stopwatch.GetElapsedTime(timed).TotalMilliseconds;
+            SetStage("contentCheck");
+            await PageContentInspector.EnsureFinalContentAsync(page, () => latestDocumentStatus,
+                () => latestDocumentFailure, token).ConfigureAwait(false);
+            successful = true;
+            if (_business.ExportRunData)
+            {
+                SetStage("storage");
+                timed = Stopwatch.GetTimestamp();
+                using var exportTimeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+                exportTimeout.CancelAfter(TimeSpan.FromSeconds(3));
+                Task<string>? snapshot = null;
+                try
+                {
+                    snapshot = context!.StorageStateAsync(new() { IndexedDB = false });
+                    var state = await snapshot.WaitAsync(exportTimeout.Token).ConfigureAwait(false);
+                    await File.WriteAllTextAsync(Path.Combine(run.Directory, "storage-state.json"), state, exportTimeout.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (!token.IsCancellationRequested)
+                {
+                    logger.Warning(ex, "会话快照未导出，跳过保存并继续关闭浏览器，TaskId={TaskId}，UvId={UvId}", run.TaskId, run.UvId);
+                }
+                finally
+                {
+                    if (snapshot is not null) _ = snapshot.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                }
+                stages["storageMs"] = Stopwatch.GetElapsedTime(timed).TotalMilliseconds;
+            }
+            SetStage("cacheDrain");
             // Bound each cache capture. No background writes outlive the UV.
             Task[] pending;
             lock (cacheSync) pending = cacheTasks.ToArray();
@@ -123,12 +223,28 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
         catch (Exception ex) { errors.Add(ex); }
         finally
         {
+            if (page is not null)
+            { page.Response -= documentResponse; page.RequestFailed -= documentFailure; }
+            activeStage?.Dispose();
+            using var cleanupStage = _metrics.Track("清理");
+            lifetime.StopWatching();
+            if (lifetime.Reason is { } closeReason && !cancellationToken.IsCancellationRequested)
+            {
+                errors.RemoveAll(error => error is OperationCanceledException);
+                errors.Add(new InvalidOperationException(closeReason));
+                successful = false;
+                logger.Warning("业务浏览器非预期退出，TaskId={TaskId}，UvId={UvId}，Stage={Stage}，Reason={Reason}；结束当前UV并释放资源",
+                    run.TaskId, run.UvId, stage, closeReason);
+            }
             var closing = Stopwatch.GetTimestamp();
             captureStop.Cancel();
             if (context is not null)
             {
-                try { gracefulContextCloseTimedOut = !await CloseContextGracefullyAsync(() => context.CloseAsync(),
-                    TimeSpan.FromSeconds(3), logger, run.TaskId, run.UvId).ConfigureAwait(false); }
+                try
+                {
+                    gracefulContextCloseTimedOut = !await CloseContextGracefullyAsync(() => context.CloseAsync(),
+                    TimeSpan.FromSeconds(3), logger, run.TaskId, run.UvId).ConfigureAwait(false);
+                }
                 catch (Exception ex) when (token.IsCancellationRequested) { logger.Debug(ex, "取消后 Context 已退出"); }
                 catch (Exception ex) { errors.Add(ex); }
             }
@@ -146,21 +262,36 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
             await Task.WhenAll(remaining).ConfigureAwait(false);
             stages["cleanupMs"] = Stopwatch.GetElapsedTime(closing).TotalMilliseconds;
             _metrics.Stage("cleanup", Stopwatch.GetElapsedTime(closing));
-            await File.WriteAllTextAsync(Path.Combine(run.Directory, "result.json"), new JObject
+            if (_business.ExportRunData) await File.WriteAllTextAsync(Path.Combine(run.Directory, "result.json"), new JObject
             {
-                ["taskId"] = run.TaskId, ["uvId"] = run.UvId, ["deviceKey"] = run.Device.DeviceKey,
-                ["proxyServer"] = run.Proxy?.Server, ["pageViews"] = run.PageViews, ["actualPageViews"] = actualViews,
+                ["taskId"] = run.TaskId,
+                ["uvId"] = run.UvId,
+                ["deviceKey"] = run.Device.DeviceKey,
+                ["hiddenMode"] = run.Options.IsHiddenMode,
+                ["proxyServer"] = run.Proxy?.Server,
+                ["pageViews"] = run.PageViews,
+                ["actualPageViews"] = actualViews,
                 ["success"] = successful && errors.Count == 0 && !token.IsCancellationRequested,
-                ["canceled"] = token.IsCancellationRequested, ["failureStage"] = errors.Count > 0 ? stage : null,
-                ["profileCleanupDeferred"] = cleanupDeferred, ["browserPeakCommittedBytes"] = browserPeakBytes,
+                ["canceled"] = cancellationToken.IsCancellationRequested,
+                ["failureStage"] = errors.Count > 0 ? stage : null,
+                ["browserInterrupted"] = lifetime.Reason is not null && !cancellationToken.IsCancellationRequested,
+                ["browserInterruptionReason"] = lifetime.Reason,
+                ["profileCleanupDeferred"] = cleanupDeferred,
+                ["browserPeakCommittedBytes"] = browserPeakBytes,
                 ["gracefulContextCloseTimedOut"] = gracefulContextCloseTimedOut,
                 ["viewport"] = viewport is null ? JValue.CreateNull() : JObject.FromObject(viewport),
                 ["elapsedMs"] = Stopwatch.GetElapsedTime(started).TotalMilliseconds,
-                ["stages"] = stages, ["errors"] = new JArray(errors.Select(error => error.Message).ToArray())
+                ["stages"] = stages,
+                ["errors"] = new JArray(errors.Select(error => error.Message).ToArray()),
+                ["navigationWarnings"] = new JArray(navigationWarnings)
             }.ToString(), CancellationToken.None).ConfigureAwait(false);
         }
-        token.ThrowIfCancellationRequested();
-        if (errors.Count > 0) throw new AggregateException("业务 UV 执行或清理失败。", errors);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (errors.Count > 0)
+        {
+            _metrics.Failure(stage);
+            throw new AggregateException("业务 UV 执行或清理失败。", errors);
+        }
         logger.Information("业务 UV 完成，TaskId={TaskId}，UvId={UvId}，ElapsedMs={ElapsedMs}",
             run.TaskId, run.UvId, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
         return successful;
@@ -189,8 +320,13 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
             _metrics.CacheLookup(hit is not null);
             if (hit is not null)
             {
-                await route.FulfillAsync(new() { Status = 200, ContentType = hit.ContentType,
-                    Headers = hit.Headers, BodyBytes = hit.Body }).ConfigureAwait(false);
+                await route.FulfillAsync(new()
+                {
+                    Status = 200,
+                    ContentType = hit.ContentType,
+                    Headers = hit.Headers,
+                    BodyBytes = hit.Body
+                }).ConfigureAwait(false);
                 return;
             }
         }
@@ -241,6 +377,28 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
         }
     }
 
+    internal static async Task RunSetupAsync(Func<CancellationToken, Task> initialize, int seconds,
+        Func<string> stage, Action abort, CancellationToken token)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+        deadline.CancelAfter(TimeSpan.FromSeconds(seconds));
+        Task? operation = null;
+        try
+        {
+            operation = initialize(deadline.Token);
+            await operation.WaitAsync(deadline.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Kill this UV's process tree before another launch can take its setup slot.
+            abort();
+            if (operation is not null) _ = operation.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+            if (ex is OperationCanceledException && !token.IsCancellationRequested && deadline.IsCancellationRequested)
+                throw new TimeoutException($"浏览器准备超时（{seconds}秒），卡在 {stage()}，已终止本UV浏览器并释放启动名额。", ex);
+            throw;
+        }
+    }
+
     private static async Task<T> AwaitAsync<T>(Task<T> operation, CancellationToken token)
     {
         try { return await operation.WaitAsync(token).ConfigureAwait(false); }
@@ -264,6 +422,7 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
         if (!File.Exists(executable)) throw new FileNotFoundException("找不到 Chrome 145。", executable);
         viewport ??= MatchViewport(device);
         ipEnvironment ??= BrowserIpEnvironment.From(run);
+
         var (width, height, scale) = (viewport.CssWidth, viewport.CssHeight, viewport.DeviceScaleFactor);
         var args = new List<string>
         {
@@ -284,6 +443,8 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
             $"--user-agent={device.UserAgent}",
             $"--hardware-concurrency={device.CpuCores}",
             "--device-memory=8",
+            "--incognito",
+            "--enable-incognito-themes",
             $"--fingerprint={System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(device.DeviceKey))) % 1000000}"
         };
         if (device.Model.Length > 0) args.Add($"--product-model={device.Model}");
@@ -322,13 +483,21 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
         var (width, height, scale) = (viewport.CssWidth, viewport.CssHeight, viewport.DeviceScaleFactor);
         return new BrowserNewContextOptions
         {
-            HasTouch = true, IsMobile = true, UserAgent = run.Device.UserAgent,
-            Proxy = run.Proxy?.HasProxy != true ? null : new Proxy { Server = run.Proxy.PlaywrightServer!,
-                Username = run.Proxy.Username, Password = run.Proxy.Password },
+            HasTouch = true,
+            IsMobile = true,
+            UserAgent = run.Device.UserAgent,
+            Proxy = run.Proxy?.HasProxy != true ? null : new Proxy
+            {
+                Server = run.Proxy.PlaywrightServer!,
+                Username = run.Proxy.Username,
+                Password = run.Proxy.Password
+            },
             ServiceWorkers = run.Options.IsCacheMode ? ServiceWorkerPolicy.Block : ServiceWorkerPolicy.Allow,
             ViewportSize = new() { Width = width, Height = height },
             ScreenSize = new() { Width = width, Height = height },
-            DeviceScaleFactor = scale, Locale = "zh-CN", IgnoreHTTPSErrors = true,
+            DeviceScaleFactor = scale,
+            Locale = "zh-CN",
+            IgnoreHTTPSErrors = true,
             TimezoneId = ipEnvironment.TimezoneId,
             Geolocation = ipEnvironment.Latitude is { } latitude && ipEnvironment.Longitude is { } longitude
                 ? new Geolocation { Latitude = (float)latitude, Longitude = (float)longitude } : null,
@@ -338,12 +507,15 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
 
     /// <summary>One deterministic Android model/resolution match, shared by launch flags and context emulation.</summary>
     private static DeviceProfileResult MatchViewport(BusinessDeviceProfile device) =>
-        AndroidViewportMatcher.Match(device.ScreenWidth, device.ScreenHeight, device.Make, device.Model);
+        AndroidViewportMatcher.Match(device.ScreenWidth, device.ScreenHeight, device.Make, device.Model, device.DevicePixelRatio);
 
     /// <summary>jstext 原样解析为 JObject 注入页面；页面脚本据此执行各自的广告/交互逻辑，空任务为 null。</summary>
     private static string BuildInitScript(BusinessUvRun run) => "window.__trafficVistaTask = " + new JObject
     {
-        ["taskId"] = run.TaskId, ["uvId"] = run.UvId, ["deviceKey"] = run.Device.DeviceKey,
-        ["pageViews"] = run.PageViews, ["jstext"] = run.Jstext
+        ["taskId"] = run.TaskId,
+        ["uvId"] = run.UvId,
+        ["deviceKey"] = run.Device.DeviceKey,
+        ["pageViews"] = run.PageViews,
+        ["jstext"] = run.Jstext
     }.ToString(Newtonsoft.Json.Formatting.None);
 }

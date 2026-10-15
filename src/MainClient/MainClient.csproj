@@ -31,6 +31,7 @@
 	</ItemGroup>
 	<ItemGroup>
 		<None Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+		<None Update="Collect-MemoryDiagnostics.ps1" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
 		<None Update="data/net/ipzan/regions.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
 		<!-- 用户文件由运行时生成，构建/发布不覆盖已有用户设置。 -->
 		<None Update="appsettings.user.json" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />

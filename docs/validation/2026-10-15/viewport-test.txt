@@ -1,0 +1,13 @@
+PASS
+Samsung SM-G991B 输入=1080x2400 → Physical=1080x2400, CSS=411x914, DPR=2.625, DprX=2.6277, DprY=2.6258, Source=estimated, Strategy=preferred, Fallback=False, Reason=
+Honor AMG-AN00 输入=720x1600 → Physical=720x1600, CSS=360x800, DPR=2.000, DprX=2.0000, DprY=2.0000, Source=estimated, Strategy=preferred, Fallback=False, Reason=
+OnePlus NE2210 输入=1440x3216 → Physical=1440x3216, CSS=411x919, DPR=3.500, DprX=3.5036, DprY=3.4995, Source=estimated, Strategy=preferred, Fallback=False, Reason=
+Samsung SM-G991B 输入=2400x1080 → Physical=1080x2400, CSS=411x914, DPR=2.625, DprX=2.6277, DprY=2.6258, Source=estimated, Strategy=preferred, Fallback=False, Reason=
+Test LowResolution 输入=480x800 → Physical=480x800, CSS=320x533, DPR=1.500, DprX=1.5000, DprY=1.5009, Source=estimated, Strategy=preferred, Fallback=False, Reason=
+Test OldPhone 输入=540x960 → Physical=540x960, CSS=360x640, DPR=1.500, DprX=1.5000, DprY=1.5000, Source=estimated, Strategy=preferred, Fallback=False, Reason=
+Test ShortPhone 输入=720x1280 → Physical=720x1280, CSS=360x640, DPR=2.000, DprX=2.0000, DprY=2.0000, Source=estimated, Strategy=preferred, Fallback=False, Reason=
+Test Tablet 输入=1536x2048 → Physical=1536x2048, CSS=768x1024, DPR=2.000, DprX=2.0000, DprY=2.0000, Source=estimated, Strategy=preferred, Fallback=False, Reason=
+Test Foldable 输入=1768x2208 → Physical=1768x2208, CSS=884x1104, DPR=2.000, DprX=2.0000, DprY=2.0000, Source=estimated, Strategy=preferred, Fallback=False, Reason=
+Test 4K 输入=2160x3840 → Physical=2160x3840, CSS=557x991, DPR=3.875, DprX=3.8779, DprY=3.8749, Source=estimated, Strategy=expanded, Fallback=False, Reason=
+Test Square 输入=500x500 → Physical=500x500, CSS=333x333, DPR=1.500, DprX=1.5015, DprY=1.5015, Source=estimated, Strategy=preferred, Fallback=False, Reason=
+低分辨率、旧手机、方屏/折叠屏/平板、4K、84组尺寸比例一致性、真实DPR优先及贯通、无效DPR拒绝、覆盖限制原因验证通过。

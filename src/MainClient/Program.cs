@@ -81,6 +81,10 @@ namespace TrafficVista
                         WriteTestResult("net-test.txt", Net.NetIntegrationTest.RunAsync(Log.Logger).GetAwaiter().GetResult());
                         Log.Information("Net 模块代理领取与 IpInfo 查询自检通过");
                     }
+                    else if (args.Contains("--browser-close-test"))
+                    {
+                        WriteTestResult("browser-close-test.txt", Business.ReliabilityIntegrationTest.RunBrowserCloseAsync(Log.Logger).GetAwaiter().GetResult());
+                    }
                     else if (args.Contains("--reliability-test") || args.Contains("--benchmark") || args.Contains("--business-test"))
                     {
                         // Fully offline, isolated fixtures, including device APIs and real local Chrome.

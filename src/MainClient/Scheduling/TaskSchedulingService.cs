@@ -39,6 +39,15 @@ public sealed class TaskSchedulingService : ITaskSchedulerService
     public int ActiveUvSessions => (_consumer as BrowserTaskConsumer)?.ActiveUvCount ?? 0;
     public TaskAdmissionSnapshot? Admission => (_consumer as BrowserTaskConsumer)?.Admission;
 
+    public void UpdateHiddenMode(bool hidden)
+    {
+        lock (_sync)
+        {
+            _runOptions = _runOptions with { IsHiddenMode = hidden };
+            if (_consumer is BrowserTaskConsumer browser) browser.UpdateHiddenMode(hidden);
+        }
+    }
+
     public Task StartAsync(SchedulerOptions options, CancellationToken token = default)
         => StartAsync(_settings.Value, options, token);
 
@@ -55,6 +64,9 @@ public sealed class TaskSchedulingService : ITaskSchedulerService
             _metrics.Reset();
             _logger.Information("启动持续轮询，TaskName={TaskName}，IntervalMs={IntervalMs}，Concurrency={Concurrency}",
                 uiOptions.TaskName, uiOptions.TaskFetchInterval, uiOptions.MaxConcurrency);
+            _logger.Information("任务队列恢复模式={RecoveryMode}，运行数据导出={ExportRunData}，共享磁盘缓存={DiskCache}",
+                options.LocalCache is null ? "丢弃（仅内存）" : "保存（恢复未开始任务）",
+                _settings.Business.ExportRunData, uiOptions.IsCacheMode);
             return _engine.StartAsync(options with { CompleteWhenSourceEmpty = false }, token);
         }
     }
@@ -62,18 +74,22 @@ public sealed class TaskSchedulingService : ITaskSchedulerService
     private async Task<IReadOnlyList<TaskEnvelope>> ProduceAsync(CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
-        var batch = await _source.FetchAsync(token).ConfigureAwait(false);
+        IReadOnlyList<TaskEnvelope> batch;
+        using (_metrics.Track("任务接口")) batch = await _source.FetchAsync(token).ConfigureAwait(false);
         var expandedBytes = (long)System.Text.Encoding.UTF8.GetByteCount(Newtonsoft.Json.JsonConvert.SerializeObject(batch)) * _runOptions.Multiple;
         if ((long)batch.Count * _runOptions.Multiple > _settings.Business.MaxExpandedBatchTasks
             || expandedBytes > _settings.Business.MaxExpandedBatchMegabytes * 1024L * 1024)
         {
-            // Preserve the fetched payload for operator recovery; never silently discard oversized deliveries.
-            var recovery = Path.GetFullPath(_settings.Business.RecoveryRoot, AppContext.BaseDirectory);
-            Directory.CreateDirectory(recovery);
-            await File.WriteAllTextAsync(Path.Combine(recovery, Guid.NewGuid().ToString("N") + ".json"),
-                Newtonsoft.Json.JsonConvert.SerializeObject(new { Multiple = _runOptions.Multiple, Tasks = batch }),
-                CancellationToken.None).ConfigureAwait(false);
-            throw new InvalidDataException("任务批次倍速展开超过 Business 的任务数量/字节容量上限，原批次已保存至 Business:RecoveryRoot。");
+            var save = _settings.Business.ExportRunData || _settings.Business.TaskRecoveryMode == Business.TaskRecoveryMode.Save;
+            if (save)
+            {
+                var recovery = Path.GetFullPath(_settings.Business.RecoveryRoot, AppContext.BaseDirectory);
+                Directory.CreateDirectory(recovery);
+                await File.WriteAllTextAsync(Path.Combine(recovery, Guid.NewGuid().ToString("N") + ".json"),
+                    Newtonsoft.Json.JsonConvert.SerializeObject(new { Multiple = _runOptions.Multiple, Tasks = batch }),
+                    CancellationToken.None).ConfigureAwait(false);
+            }
+            throw new InvalidDataException("任务批次倍速展开超过容量上限，" + (save ? "原批次已保存供检查。" : "按丢弃模式处理。"));
         }
         return RepeatForMultiple(batch, _runOptions.Multiple);
     }

@@ -78,10 +78,25 @@ public sealed class HttpDeviceFingerprintProvider(HttpClient client, ILogger log
             list.Add(new BusinessDeviceProfile("", GetString(item, "make") ?? "", GetString(item, "model") ?? "",
                 GetString(item, "name") ?? "", GetString(item, "osv") ?? "", width.Value, height.Value, userAgent!,
                 GetInt(item, "cpu") ?? 8, GetString(item, "vendor") ?? "", GetString(item, "renderer") ?? "",
-                GetString(item, "oaid")));
+                GetString(item, "oaid")) { DevicePixelRatio = GetDevicePixelRatio(item) });
         }
         if (list.Count == 0) throw new InvalidDataException("设备接口没有可用设备。");
         return list;
+    }
+
+    private static float? GetDevicePixelRatio(JObject item)
+    {
+        foreach (var name in new[] { "devicePixelRatio", "deviceScaleFactor", "dpr" })
+        {
+            var value = item.GetValue(name, StringComparison.OrdinalIgnoreCase);
+            if (value is null || value.Type == JTokenType.Null) continue;
+            if (value.Type is not (JTokenType.Integer or JTokenType.Float or JTokenType.String)
+                || !float.TryParse(value.Type == JTokenType.String ? value.Value<string>() : value.ToString(Newtonsoft.Json.Formatting.None), System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var dpr) || !float.IsFinite(dpr) || dpr <= 0)
+                throw new InvalidDataException("设备接口DPR必须是有限正数：" + name);
+            return dpr;
+        }
+        return null;
     }
 
     private static string? GetString(JObject item, string name) =>

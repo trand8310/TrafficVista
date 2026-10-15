@@ -1,0 +1,5 @@
+PASS
+模式=可见，启动默认页面=0，业务页面目标=1，可见窗口=1
+模式=headless，启动默认页面=0，业务页面目标=1，可见窗口=0
+启动无默认窗口，一个 UV 只有一个业务页面；可见/隐藏模式及自有进程/profile清理通过。
+输出目录：F:\codex\TrafficVista\src\Build\demo-output\window-tests\6d376ac464344148846718d5e700bda2

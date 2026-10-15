@@ -10,19 +10,20 @@ internal sealed class OwnedChromeSession : IAsyncDisposable
     private readonly ChromeProcessJob _job;
     private readonly string _profile;
     private readonly CancellationTokenRegistration _cancel;
+    private readonly bool _writeCleanupMarker;
     internal IBrowser? Browser { get; private set; }
     internal bool ProfileCleanupDeferred { get; private set; }
     internal ulong PeakMemoryBytes => _job.PeakMemoryBytes;
 
-    private OwnedChromeSession(ChromeProcessJob job, string profile, CancellationToken token)
+    private OwnedChromeSession(ChromeProcessJob job, string profile, CancellationToken token, bool writeCleanupMarker)
     {
-        _job = job; _process = job.Process; _profile = profile;
+        _job = job; _process = job.Process; _profile = profile; _writeCleanupMarker = writeCleanupMarker;
         // Only this session's process tree is terminated; other Chrome instances are never enumerated/killed.
         _cancel = token.Register(Kill);
     }
 
     internal static async Task<OwnedChromeSession> StartAsync(IPlaywright playwright,
-        BrowserTypeLaunchOptions options, string directory, CancellationToken token)
+        BrowserTypeLaunchOptions options, string directory, CancellationToken token, bool writeCleanupMarker = true)
     {
         token.ThrowIfCancellationRequested();
         var profile = Path.GetFullPath(Path.Combine(directory, "chrome-profile"));
@@ -39,7 +40,7 @@ internal sealed class OwnedChromeSession : IAsyncDisposable
         if (options.Proxy is { } proxy) info.ArgumentList.Add("--proxy-server=" + proxy.Server);
         var job = ChromeProcessJob.Start(info);
         var process = job.Process;
-        var session = new OwnedChromeSession(job, profile, token);
+        var session = new OwnedChromeSession(job, profile, token, writeCleanupMarker);
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -75,6 +76,8 @@ internal sealed class OwnedChromeSession : IAsyncDisposable
         }
         catch { await session.DisposeAsync().ConfigureAwait(false); throw; }
     }
+
+    internal void Abort() => Kill();
 
     private void Kill()
     {
@@ -124,7 +127,7 @@ internal sealed class OwnedChromeSession : IAsyncDisposable
                         // Antivirus/indexers can retain handles after every Chrome process has exited.
                         // A marked, completed run is retried by retention; this is not a navigation failure.
                         ProfileCleanupDeferred = true;
-                        await File.WriteAllTextAsync(Path.Combine(Path.GetDirectoryName(_profile)!, "profile-cleanup.pending"), ex.Message);
+                        if (_writeCleanupMarker) await File.WriteAllTextAsync(Path.Combine(Path.GetDirectoryName(_profile)!, "profile-cleanup.pending"), ex.Message);
                     }
                 }
             }

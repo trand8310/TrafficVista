@@ -1,0 +1,3 @@
+PASS
+真实 UI 消息循环异常已处理。
+未观察的 Task 异常已处理，SetObserved 已生效。

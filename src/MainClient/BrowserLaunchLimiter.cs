@@ -4,13 +4,18 @@ namespace TrafficVista;
 public sealed class BrowserLaunchLimiter : IDisposable
 {
     private readonly SemaphoreSlim _slots;
+    private readonly SemaphoreSlim _pace = new(1, 1);
+    private long _lastStart;
+    public int StartIntervalMilliseconds { get; }
     private int _activeStarts;
     private int _peakStarts;
 
-    public BrowserLaunchLimiter(int maxConcurrentStarts)
+    public BrowserLaunchLimiter(int maxConcurrentStarts, int startIntervalMilliseconds = 100)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(maxConcurrentStarts, 1);
         MaxConcurrentStarts = maxConcurrentStarts;
+        ArgumentOutOfRangeException.ThrowIfNegative(startIntervalMilliseconds);
+        StartIntervalMilliseconds = startIntervalMilliseconds;
         _slots = new SemaphoreSlim(maxConcurrentStarts, maxConcurrentStarts);
     }
 
@@ -20,6 +25,23 @@ public sealed class BrowserLaunchLimiter : IDisposable
     public async Task ExecuteAsync(Func<Task> start, CancellationToken cancellationToken)
     {
         await _slots.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await _pace.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (_lastStart != 0)
+                {
+                    var remaining = TimeSpan.FromMilliseconds(StartIntervalMilliseconds)
+                        - System.Diagnostics.Stopwatch.GetElapsedTime(_lastStart);
+                    if (remaining > TimeSpan.Zero) await Task.Delay(remaining, cancellationToken).ConfigureAwait(false);
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+                _lastStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            }
+            finally { _pace.Release(); }
+        }
+        catch { _slots.Release(); throw; }
         var active = Interlocked.Increment(ref _activeStarts);
         int previous;
         do
@@ -39,5 +61,5 @@ public sealed class BrowserLaunchLimiter : IDisposable
         }
     }
 
-    public void Dispose() => _slots.Dispose();
+    public void Dispose() { _slots.Dispose(); _pace.Dispose(); }
 }
