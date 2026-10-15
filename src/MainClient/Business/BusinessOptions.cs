@@ -23,7 +23,7 @@ public sealed record BusinessOptions
     public TaskRecoveryMode TaskRecoveryMode { get; init; } = TaskRecoveryMode.Discard;
     /// <summary>显式开启后才导出任务、设备、运行结果及会话快照。</summary>
     public bool ExportRunData { get; init; } = false;
-    /// <summary>Chrome连接后，Context、页面及环境设置共用的准备超时。</summary>
+    /// <summary>Chrome启动后，Context、页面及环境设置共用的准备超时。</summary>
     public int BrowserSetupTimeoutSeconds { get; init; } = 20;
     public string ChromeExecutablePath { get; init; } = "File/chrome-win/145.0.7632.110/chrome.exe";
 

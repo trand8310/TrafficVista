@@ -2,7 +2,7 @@
 
 Windows / .NET 8 WinForms 客户端；每个 UV 使用独立 Chrome 进程及浏览器 Context。修复与实测记录见 ../IMPROVEMENTS.md。
 
-业务 Chrome 启动使用 --no-startup-window，不创建默认 profile 的 about:blank 窗口；独立 Context 的业务页面是该 UV 唯一由客户端创建的页面/窗口。窗口回归通过 CDP 枚举页面目标及可见窗口 ID，覆盖可见/隐藏模式，避免并发 1 时一个 UV 显示两个窗口。
+业务 Chrome 使用 LaunchAsync 直接启动，每个 UV 使用独立浏览器进程、新临时 profile 和独立 Context，不跨 UV 复用 Cookie 或存储。同 UV 的多个 PV 继续复用页面和 Context。Playwright 管理浏览器通信、临时 profile 与关闭清理，不再等待 DevToolsActivePort 或通过 ConnectOverCDPAsync 附加。启动无默认页面，一个 UV 只有一个业务页面/窗口。图片拦截与 IsCacheMode 行为保持原配置。
 
 ## 配置
 
@@ -74,22 +74,31 @@ CPU趋势85%或物理/提交可用内存低于max(512MiB,总物理内存10%)时�
 
 ## 停止与恢复
 
-业务 Chrome 由 Windows Job Object 持有；独立 profile、CDP 端点与进程树均属于当前 UV。取消关联进程树终止，同时取消等待中的浏览器 API；正常关闭也结束所有子进程。浏览器连接、Context 关闭与进程退出有独立上限。Context 优雅关闭超时后，继续强制结束并确认自有 Job 全部退出；强制清理出错仍记失败，优雅关闭慢本身不会把已完成访问误记失败，结果保存 gracefulContextCloseTimedOut。迟到的关闭异常会被观察。文件被索引器/杀毒程序短暂占用时，保留 profile-cleanup.pending，后续会话清理重试，不把页面访问成功误判为失败。
+业务 Chrome 由 Playwright 启动后，使用该浏览器内部 CDP 查询主进程 ID，再通过系统父子进程快照将启动时已有的辅助进程一并纳入 Windows Job Object；已有沙箱进程必要时使用独立嵌套 Job，后续子进程继承归属，不通过名称查杀其它 Chrome。独立 profile 和进程树均属于当前 UV。取消关联进程树终止，同时取消等待中的浏览器 API；正常关闭也结束所有子进程。启动默认30秒、进程归属设置10秒、Context关闭和进程退出各有独立上限。启动 API 不支持 token 时，取消会等待有界启动任务完成并关闭迟到的浏览器后再释放启动名额。Context 优雅关闭超时后，继续强制结束并确认自有 Job 全部退出；强制清理出错仍记失败，优雅关闭慢本身不会把已完成访问误记失败，结果保存 gracefulContextCloseTimedOut。迟到的关闭异常会被观察。临时profile由Playwright驱动管理；profileCleanupDeferred保留为旧结果字段，当前路径不生成自有profile-cleanup.pending。历史运行的延迟清理标记仍由会话维护处理。
 
 Business:TaskRecoveryMode 默认 Discard：取回的任务进入有界内存队列，停止、异常退出后不恢复，也不读取历史收件箱。设为 Save 时，客户端先保存整批交付再入队；停止时排队、首UV名额等待及尚未入队的批次尾部会保留，下次同任务接口和名称启动时恢复，并使用本次启动的执行配置。已开始执行的任务（包括执行中取消、失败和进程崩溃）不自动重放，避免重复执行已完成UV。此配置替代旧 PersistPendingTasks 字段，修改后重启生效。切回 Discard 不自动删除旧收件箱。
 
-Business:ExportRunData 默认 false：不导出 task/device/viewport/IP环境/result/summary/storage-state，也不做归档保留扫描。Cookie、localStorage 和同UV多个PV的会话由同一浏览器Context维护，无需导出。Chrome自身仍需要临时profile，放在系统临时目录 TrafficVista/uv，关闭后清理。显式设为 true 才保存业务运行归档；会话快照不收集IndexedDB，导出最多等待3秒，失败只提示并继续关闭浏览器。诊断阶段分别显示正文检查、导出会话、缓存收尾。
+Business:ExportRunData 默认 false：不导出 task/device/viewport/IP环境/result/summary/storage-state，也不做归档保留扫描。Cookie、localStorage 和同UV多个PV的会话由同一浏览器Context维护，无需导出。Chrome临时profile由Playwright在系统临时目录创建并在浏览器关闭后清理；TrafficVista/uv只用于临时业务运行目录。显式设为 true 才保存业务运行归档；会话快照不收集IndexedDB，导出最多等待3秒，失败只提示并继续关闭浏览器。诊断阶段分别显示正文检查、导出会话、缓存收尾。
 
-启动限速名额持续占用到Context、页面、CDP环境及初始化全部准备完成，之后页面正常运行不占启动名额。Business:BrowserSetupTimeoutSeconds 默认20秒，Chrome连接后上述准备共用此超时，与页面导航超时分开；超时或取消先终止该UV的Chrome进程树，再放行下一启动，最终清理释放UV并发名额。诊断拆分会话创建、页面创建、CDP环境设置、页面初始化，超时日志记录TaskId/UvId及具体失败阶段。
+启动限速名额持续占用到Context、页面、CDP环境及初始化全部准备完成，之后页面正常运行不占启动名额。Business:BrowserSetupTimeoutSeconds 默认20秒，Chrome启动后上述准备共用此超时，与页面导航超时分开；超时或取消先终止该UV的Chrome进程树，再放行下一启动，最终清理释放UV并发名额。诊断拆分会话创建、页面创建、CDP环境设置、页面初始化，超时日志记录TaskId/UvId及具体失败阶段。
+
+代理模式下，主文档出现明确代理通道错误（ERR_PROXY_CONNECTION_FAILED、ERR_TUNNEL_CONNECTION_FAILED、SOCKS连接/目标不可达、代理认证/证书/配置协议错误等）或HTTP 407，一次即停止该任务后续UV投递。仅从浏览器主文档失败事件或导航Playwright异常提取已知错误码，不按普通错误字符串判断，也不因图片/JS加载失败中断任务。直连不启用此规则。ERR_CONNECTION_RESET/REFUSED/TIMED_OUT/NAME_NOT_RESOLVED等通用错误以及502/504可能来自目标网站，不单凭这些认定代理不可用。已投UV继续完成，其他任务继续；任务摘要原因是proxy-unavailable:<错误码>。代理获取失败/到期仍按原有规则处理。
+
+同一任务内，按UV完成顺序连续3次主文档HTTP 644失败后，停止尚未投递的UV；等待UV名额/投递间隔也立即结束，已投出的UV继续正常完成和清理。成功、非644失败会清零连续次数；其他任务和同ID的下一轮消费各自独立。失败任务摘要原因记为consecutive-http-644，未投UV单独计数，不冒充取消或已完成。首次导航、刷新及结束检查的644保留类型化状态，识别不依赖错误文本；确定644后无需继续等待空白页超时。`--http644-test`覆盖阈值、清零、任务隔离、在途UV保留及真实Chrome导航。
 
 任务按已确认的消耗性规则处理：失败后记录结果并继续下一个，不自动重投已开始或失败的任务，无需服务端确认或租约。队列容量每轮启动按界面“并发数 × 倍率 × 2”计算，队列满时等待空位并暂停获取下一批。这提供客户端待执行恢复与一次性领取，远程领取成功但本地尚未落盘仍有崩溃窗口，不宣称端到端 exactly-once。恢复顺序不承诺原始批次顺序。第二个进程使用同一收件箱会被排他锁拒绝；如需同机多个独立调度器，应使用不同运行目录。
 
 ## 缓存与保留
 
-未开启可选共享缓存模式时，使用 Chrome 正常缓存策略，允许 Service Worker；同 UV 刷新可以命中原生缓存，不清 Cookie、不清缓存。当前用户配置 IsCacheMode=false 对应这一模式，而不是关闭 Chrome 原生缓存。
+IsCacheMode=false 时不安装资源拦截，字体和视频正常加载，Chrome 使用原生 HTTP 缓存并允许 Service Worker；同 UV 的 Cookie/localStorage 和缓存持续保留，不同 UV 独立。此前字体/媒体的禁止加载 Route 已按最新要求移除。
 
-开启 IsCacheMode 时使用共享磁盘缓存，只接受明确 public + 正 max-age 的图片/CSS/字体响应；Cookie、Authorization、Range、Set-Cookie、private/no-store/no-cache、未知 Vary、未知长度、压缩正文、媒体及超过 1 MiB 的资源全部绕过。键包括 URL、UA、Accept、Accept-Language、Accept-Encoding、Origin 和代理出口信息。TTL 同时受响应剩余寿命与 StaticCacheTtlHours 约束；头和正文在一个 .entry 文件中原子发布，读写采用异步 I/O，最多两个缓存捕获同时进行。旧 v1 缓存不再复用。此模式借助 Playwright Route 拦截，框架会自动关闭原生 HTTP 缓存，并阻止 Service Worker；其缓存命中来自项目共享缓存。[Playwright Route 说明](https://playwright.dev/dotnet/docs/api/class-page#page-route)。
+IsCacheMode=true 时，共享磁盘缓存接收非 GIF 图片、CSS、JS、字体和视频（含音轨及常见 HLS/DASH 分段请求）。GIF 按 URL 扩展名（忽略大小写和查询参数）、image/gif MIME 与 GIF87a/GIF89a 文件头识别，正常走网络、不入库。支持 gzip/br 等浏览器已解码响应、chunked/无 Content-Length 的完整响应，不设单资源大小上限，不再施加2秒正文捕获超时；UV 取消仍会终止捕获。Playwright 的 BodyAsync 与文件回填接口仍会缓冲响应，超大资源实际受可用内存、磁盘和框架能力约束，不能保证恒定内存占用。
 
+只缓存 GET 的200响应，以及具备有效Content-Range、明确Range请求且字节长度匹配的206响应；视频每个Range/If-Range组合独立成键，不把分段作为完整文件回填，压缩206不缓存。普通资源仅按完整URL（含查询参数）的SHA256定位；Cookie、UA、其他协商请求头和代理出口不参与键，相同URL跨UV共享同一正文。URL不变时，即使不同身份或服务端返回内容已改变，到期前仍复用已存正文。浏览器Context、Cookie及存储仍独立；回填剔除Set-Cookie，避免把响应Cookie写入其他UV。共享缓存不再受Cache-Control（包括private/no-store/no-cache/max-age）、Expires、Age、Date、Vary或Authorization限制。命中不重复捕获、不延长首次写入的配置TTL。
+
+缓存位于StaticCacheRoot/v4。正文文件和原子元数据配合读取租约，避免覆盖/容量清理破坏活跃回填；保留Content-Type字符集和206的Content-Range，移除压缩、分块等传输头。StaticCacheMaxMegabytes默认512，作为总容量软预算淘汰较旧条目；单个新文件超过预算仍保留，不因此拒绝大资源。TTL仅使用StaticCacheTtlHours（默认24小时），从资源写入时间计算；修改配置并重启后，现有v4条目也按原写入时间加新时长判断。到期后下次访问重新下载；容量清理仍可能提前淘汰条目。旧v1/v2/v3缓存不复用，旧目录不自动删除。最多两个资源同时捕获，繁忙时绕过；未下载完成的响应不写入。共享缓存依靠Route实现，会禁用原生HTTP缓存并阻止Service Worker；关闭此模式才使用原生缓存。[Playwright Route说明](https://playwright.dev/dotnet/docs/api/class-browsercontext#browser-context-route)。
+
+`--static-cache-test` 使用本地真实Chrome验证大图片、gzip JS、chunked CSS、字体、视频完整响应与两个206分段的跨UV复用、GIF排除、跨Cookie/UV同URL复用、配置TTL覆盖服务器策略、过期边界/重启配置、取消写入和活跃读取租约。视频用例验证HTTP内容与Range回填，不验证所有媒体编码格式的实际播放。
 SessionRetentionDays 默认 7，SessionMaxMegabytes 默认 1024；每小时检查带 run.lock 与 summary.json 的已完成运行，按期限与容量清理。活跃锁、链接路径、历史未标记 profile 都不会自动删除。延迟删除的临时 profile 在清理周期重试。静态缓存有独立容量上限。
 
 ## 观测与验证
@@ -102,7 +111,7 @@ SessionRetentionDays 默认 7，SessionMaxMegabytes 默认 1024；每小时检�
 
 右侧统计栏每项指标独占一行，显示速率、UV累计量、任务累计量、并发名额和最慢阶段。统计栏独立使用窗体右侧高度，小窗口可滚动；日志保留在左侧，双击统计仍可打开详细诊断。
 
-UI 分别显示任务、UV 与浏览器数量，并显示 UV 成功/失败/取消、成功 UV/min、最近 1024 个样本的 P95 和待恢复数量。UV 延迟从获得许可后的设备准备开始，不包含此前排队；平均阶段耗时包括 UV 排队、代理、设备、启动、导航与清理。result.json 记录实际 PV、失败阶段、阶段耗时、单 UV 整个 Chrome Job 的峰值提交内存。
+UI 分别显示任务、UV 与浏览器数量，并显示 UV 成功/失败/取消、成功 UV/min、最近 1024 个样本的 P95 和待恢复数量。UV 延迟从获得许可后的设备准备开始，不包含此前排队；平均阶段耗时包括 UV 排队、代理、设备、启动、导航与清理。result.json 记录实际 PV、失败阶段、阶段耗时、单 UV Chrome Job 的峰值提交内存；需要多个启动子进程 Job 时，记录各 Job 峰值之和，作为保守上界。启动计时额外拆出 browserLaunchMs（启动和进程归属设置）与 browserSetupMs（页面及环境初始化），保留 browserStartMs 总准备耗时。
 
 准入状态显示暂停原因、预留名额、等待准入任务和已准入任务尚未投递的 UV 数；CPU、可用内存和新任务内存名额可悬停查看。尚未准入的排队任务 UV 不计入“待投递UV”。自动学习仅在当前轮次有效，下轮重新采样与校准。
 

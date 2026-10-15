@@ -1,12 +1,11 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 namespace TrafficVista.Business;
 
-/// <summary>Start suspended, attach to a kill-on-close job, then resume: every Chrome descendant stays owned.</summary>
+/// <summary>Owns a Playwright-launched Chrome and its descendants in a kill-on-close job.</summary>
 internal sealed class ChromeProcessJob : IDisposable
 {
     private static readonly object RegistrySync = new();
@@ -16,64 +15,94 @@ internal sealed class ChromeProcessJob : IDisposable
         get { lock (RegistrySync) return checked((int)Registry.Sum(job => (long)job.ActiveProcesses)); }
     }
     private readonly SafeFileHandle _job;
+    private readonly List<SafeFileHandle> _startupJobs = [];
     internal Process Process { get; }
-    internal ulong PeakMemoryBytes => QueryInformationJobObject(_job, 9, out ExtendedLimits limits,
-        (uint)Marshal.SizeOf<ExtendedLimits>(), 0) ? limits.PeakJobMemoryUsed.ToUInt64() : 0;
-    internal uint ActiveProcesses => QueryInformationJobObject(_job, 1, out Accounting accounting,
-        (uint)Marshal.SizeOf<Accounting>(), 0) ? accounting.ActiveProcesses : throw new Win32Exception(Marshal.GetLastWin32Error());
+    // Sum of job peaks is a conservative upper bound when startup children need separate nested jobs.
+    internal ulong PeakMemoryBytes => AllJobs.Aggregate(0UL, (sum, job) => sum +
+        (QueryInformationJobObject(job, 9, out ExtendedLimits limits,
+        (uint)Marshal.SizeOf<ExtendedLimits>(), 0) ? limits.PeakJobMemoryUsed.ToUInt64() : 0));
+    private SafeFileHandle[] AllJobs
+    {
+        get { lock (RegistrySync) return new[] { _job }.Concat(_startupJobs).ToArray(); }
+    }
+    internal uint ActiveProcesses => AllJobs.Aggregate(0U, (sum, job) => sum +
+        (QueryInformationJobObject(job, 1, out Accounting accounting,
+        (uint)Marshal.SizeOf<Accounting>(), 0) ? accounting.ActiveProcesses : throw new Win32Exception(Marshal.GetLastWin32Error())));
 
     private ChromeProcessJob(SafeFileHandle job, Process process)
     { _job = job; Process = process; lock (RegistrySync) Registry.Add(this); }
 
-    internal static ChromeProcessJob Start(ProcessStartInfo info)
+    internal static ChromeProcessJob Attach(int browserProcessId)
     {
+        var process = Process.GetProcessById(browserProcessId);
         var job = CreateJobObjectW(0, null);
-        if (job.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
-        var limits = new ExtendedLimits { Basic = new BasicLimits { LimitFlags = 0x2000 } };
-        ProcessInformation created = default;
         try
         {
-            if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf<ExtendedLimits>()))
+            if (job.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+            var limits = new ExtendedLimits { Basic = new BasicLimits { LimitFlags = 0x2000 } };
+            if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf<ExtendedLimits>())
+                || !AssignProcessToJobObject(job, process.Handle))
                 throw new Win32Exception(Marshal.GetLastWin32Error());
-            var startup = new StartupInfo { Size = Marshal.SizeOf<StartupInfo>() };
-            var command = new StringBuilder(string.Join(" ", new[] { info.FileName }.Concat(info.ArgumentList).Select(Quote)));
-            if (!CreateProcessW(info.FileName, command, 0, 0, false, 0x4 | 0x08000000, 0,
-                    Path.GetDirectoryName(info.FileName), ref startup, out created))
-                throw new Win32Exception(Marshal.GetLastWin32Error());
-            if (!AssignProcessToJobObject(job, created.Process)) throw new Win32Exception(Marshal.GetLastWin32Error());
-            var process = Process.GetProcessById((int)created.ProcessId);
-            if (ResumeThread(created.Thread) == uint.MaxValue) { process.Dispose(); throw new Win32Exception(Marshal.GetLastWin32Error()); }
             return new ChromeProcessJob(job, process);
         }
-        catch
-        {
-            if (created.Process != 0) TerminateProcess(created.Process, 1);
-            job.Dispose(); throw;
-        }
-        finally
-        {
-            if (created.Thread != 0) CloseHandle(created.Thread);
-            if (created.Process != 0) CloseHandle(created.Process);
-        }
+        catch { job.Dispose(); process.Dispose(); throw; }
     }
 
-    internal void Kill() { if (!_job.IsClosed) TerminateJobObject(_job, 1); }
-    public void Dispose()
-    { lock (RegistrySync) { Registry.Remove(this); _job.Dispose(); Process.Dispose(); } }
-
-    private static string Quote(string argument)
+    // Include startup helpers omitted by CDP (for example crash handlers).
+    // Only descendants of the browser PID are selected, never processes matched by name.
+    internal void AttachExistingProcesses()
     {
-        var result = new StringBuilder("\"");
-        var slashes = 0;
-        foreach (var ch in argument)
+        using var snapshot = CreateToolhelp32Snapshot(2, 0);
+        if (snapshot.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+        var entry = new ProcessEntry { Size = (uint)Marshal.SizeOf<ProcessEntry>() };
+        var parents = new Dictionary<int, int>();
+        if (!Process32FirstW(snapshot, ref entry)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        do { parents[(int)entry.Id] = (int)entry.ParentId; } while (Process32NextW(snapshot, ref entry));
+        var processIds = new List<int> { Process.Id };
+        for (var index = 0; index < processIds.Count; index++)
+            processIds.AddRange(parents.Where(p => p.Value == processIds[index] && !processIds.Contains(p.Key)).Select(p => p.Key));
+        foreach (var id in processIds)
         {
-            if (ch == '\\') { slashes++; continue; }
-            if (ch == '"') result.Append('\\', slashes * 2 + 1).Append(ch);
-            else result.Append('\\', slashes).Append(ch);
-            slashes = 0;
+            if (id == Process.Id) continue;
+            try
+            {
+                using var child = Process.GetProcessById(id);
+                // A snapshot can contain an older process whose recorded parent PID has
+                // since been reused by this browser. It is not ours; neither attach nor kill it.
+                if (child.StartTime < Process.StartTime) continue;
+                var alreadyOwned = false;
+                foreach (var ownedJob in AllJobs)
+                {
+                    if (!IsProcessInJob(child.Handle, ownedJob, out alreadyOwned))
+                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                    if (alreadyOwned) break;
+                }
+                if (!alreadyOwned && !AssignProcessToJobObject(_job, child.Handle))
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    if (child.HasExited) continue;
+                    if (error != 5) throw new Win32Exception(error);
+                    // Chromium sandbox jobs created before attachment can have an incompatible
+                    // hierarchy with the browser job. Give these processes their own nested job.
+                    var nested = CreateJobObjectW(0, null);
+                    try
+                    {
+                        var limits = new ExtendedLimits { Basic = new BasicLimits { LimitFlags = 0x2000 } };
+                        if (nested.IsInvalid || !SetInformationJobObject(nested, 9, ref limits, (uint)Marshal.SizeOf<ExtendedLimits>())
+                            || !AssignProcessToJobObject(nested, child.Handle))
+                            throw new Win32Exception(Marshal.GetLastWin32Error());
+                        lock (RegistrySync) _startupJobs.Add(nested);
+                    }
+                    catch { nested.Dispose(); throw; }
+                }
+            }
+            catch (ArgumentException) { } // The reported process has already exited.
         }
-        return result.Append('\\', slashes * 2).Append('"').ToString();
     }
+
+    internal void Kill() { foreach (var job in AllJobs) if (!job.IsClosed) TerminateJobObject(job, 1); }
+    public void Dispose()
+    { lock (RegistrySync) { Registry.Remove(this); foreach (var job in AllJobs) job.Dispose(); Process.Dispose(); } }
 
     [StructLayout(LayoutKind.Sequential)] private struct BasicLimits
     {
@@ -97,16 +126,21 @@ internal sealed class ChromeProcessJob : IDisposable
         public long TotalUserTime, TotalKernelTime, ThisPeriodUserTime, ThisPeriodKernelTime;
         public uint TotalPageFaults, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
     }
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] private struct StartupInfo
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] private struct ProcessEntry
     {
-        public int Size;
-        public string? Reserved, Desktop, Title;
-        public uint X, Y, XSize, YSize, XCountChars, YCountChars, FillAttribute, Flags;
-        public ushort ShowWindow, ReservedBytes;
-        public nint ReservedPointer, StandardInput, StandardOutput, StandardError;
+        public uint Size, Usage, Id;
+        public UIntPtr DefaultHeap;
+        public uint ModuleId, Threads, ParentId;
+        public int BasePriority;
+        public uint Flags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string Executable;
     }
-    [StructLayout(LayoutKind.Sequential)] private struct ProcessInformation
-    { public nint Process, Thread; public uint ProcessId, ThreadId; }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern SafeFileHandle CreateToolhelp32Snapshot(uint flags, uint processId);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32FirstW(SafeFileHandle snapshot, ref ProcessEntry entry);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32NextW(SafeFileHandle snapshot, ref ProcessEntry entry);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateJobObjectW(nint attributes, string? name);
     [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
@@ -114,16 +148,11 @@ internal sealed class ChromeProcessJob : IDisposable
     [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool AssignProcessToJobObject(SafeFileHandle job, nint process);
     [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsProcessInJob(nint process, SafeFileHandle job, [MarshalAs(UnmanagedType.Bool)] out bool result);
+    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool TerminateJobObject(SafeFileHandle job, uint exitCode);
     [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool QueryInformationJobObject(SafeFileHandle job, int infoClass, out ExtendedLimits info, uint length, nint returnLength);
     [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool QueryInformationJobObject(SafeFileHandle job, int infoClass, out Accounting info, uint length, nint returnLength);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool CreateProcessW(string application, StringBuilder command, nint processAttributes,
-        nint threadAttributes, [MarshalAs(UnmanagedType.Bool)] bool inherit, uint flags, nint environment,
-        string? currentDirectory, ref StartupInfo startup, out ProcessInformation created);
-    [DllImport("kernel32.dll", SetLastError = true)] private static extern uint ResumeThread(nint thread);
-    [DllImport("kernel32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool CloseHandle(nint handle);
-    [DllImport("kernel32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool TerminateProcess(nint process, uint exitCode);
 }

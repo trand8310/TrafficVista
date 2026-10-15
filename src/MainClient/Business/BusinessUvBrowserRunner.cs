@@ -14,6 +14,7 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
 {
     private readonly BusinessMetrics _metrics = metrics ?? new();
     private readonly BusinessOptions _business = business ?? new();
+    internal Action<IBrowser, IPage>? BrowserReadyForTest { get; set; }
 
     public async Task<bool> RunAsync(BusinessUvRun run, CancellationToken cancellationToken)
     {
@@ -96,39 +97,52 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
                 var launchStarted = Stopwatch.GetTimestamp();
                 stages["launchQueueMs"] = Stopwatch.GetElapsedTime(timed).TotalMilliseconds;
                 _metrics.Stage("launchQueue", Stopwatch.GetElapsedTime(timed));
-                session = await OwnedChromeSession.StartAsync(playwright, CreateLaunchOptions(run, viewport, ipEnvironment), run.Directory, token,
-                    writeCleanupMarker: _business.ExportRunData).ConfigureAwait(false);
+                session = await OwnedChromeSession.StartAsync(playwright, CreateLaunchOptions(run, viewport, ipEnvironment), run.Directory, token).ConfigureAwait(false);
+                stages["browserLaunchMs"] = Stopwatch.GetElapsedTime(launchStarted).TotalMilliseconds;
+                _metrics.Stage("browserLaunch", Stopwatch.GetElapsedTime(launchStarted));
                 _metrics.BrowserOpened();
                 lifetime.Watch(session.Browser!);
+                var setupStarted = Stopwatch.GetTimestamp();
                 await RunSetupAsync(async setupToken =>
                 {
                     SetStage("context");
-                    context = await AwaitAsync(session.Browser!.NewContextAsync(CreateContextOptions(run, viewport, ipEnvironment)), setupToken).ConfigureAwait(false);
+                    context = await AwaitAsync(session.Browser.NewContextAsync(CreateContextOptions(run, viewport, ipEnvironment)), setupToken).ConfigureAwait(false);
                     lifetime.Watch(context);
                     SetStage("page");
                     page = await AwaitAsync(context.NewPageAsync(), setupToken).ConfigureAwait(false);
-
-
                     lifetime.Watch(page);
                     page.Response += documentResponse;
                     page.RequestFailed += documentFailure;
                     SetStage("cdp");
-                    var cdp = await AwaitAsync(context.NewCDPSessionAsync(page), setupToken).ConfigureAwait(false);
-                    await AwaitAsync(cdp.SendAsync("Network.enable"), setupToken).ConfigureAwait(false);
-                    await AwaitAsync(cdp.SendAsync("Network.setBlockedURLs",
-                        new Dictionary<string, object>
-                        {
-                            ["urls"] = new[]
-                            {
-                                "*.png",
-                                "*.jpg",
-                                "*.jpeg",
-                                "*.webp",
-                                "*.mp4",
-                                "*.webm",
-                                "*.m3u8"
-                            }
-                        }), setupToken).ConfigureAwait(false);
+                    //var cdp = await AwaitAsync(context.NewCDPSessionAsync(page), setupToken).ConfigureAwait(false);
+                    //await AwaitAsync(cdp.SendAsync("Network.enable"), setupToken).ConfigureAwait(false);
+                    //await AwaitAsync(cdp.SendAsync("Network.setBlockedURLs",
+                    //    new Dictionary<string, object>
+                    //    {
+                    //        ["urls"] = new[]
+                    //        {
+                    //            "*.png",
+                    //            "*.jpg",
+                    //            "*.jpeg",
+                    //            "*.webp",
+                    //            "*.mp4",
+                    //            "*.webm",
+                    //            "*.m3u8"
+                    //        }
+                    //    }), setupToken).ConfigureAwait(false);
+
+                    //await page.RouteAsync("**/*", async route =>
+                    //{
+                    //    if (route.Request.ResourceType == "image" ||
+                    //        route.Request.ResourceType == "media")
+                    //    {
+                    //        await route.AbortAsync();
+                    //        return;
+                    //    }
+
+                    //    await route.ContinueAsync();
+                    //});
+
                     SetStage("pageInit");
                     page.SetDefaultTimeout(10000);
                     page.SetDefaultNavigationTimeout(run.Options.PageLoadingTimeout * 1000);
@@ -149,12 +163,15 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
                         await AwaitAsync(page.RouteAsync("**/*", route => ServeAsync(route, partition, token)), setupToken).ConfigureAwait(false);
                     }
                 }, _business.BrowserSetupTimeoutSeconds, () => stage, session.Abort, token).ConfigureAwait(false);
+                stages["browserSetupMs"] = Stopwatch.GetElapsedTime(setupStarted).TotalMilliseconds;
+                _metrics.Stage("browserSetup", Stopwatch.GetElapsedTime(setupStarted));
                 stages["browserStartMs"] = Stopwatch.GetElapsedTime(launchStarted).TotalMilliseconds;
                 _metrics.Stage("browserStart", Stopwatch.GetElapsedTime(launchStarted));
             }, token).ConfigureAwait(false);
             stages["launchMs"] = Stopwatch.GetElapsedTime(timed).TotalMilliseconds;
             _metrics.Stage("launch", Stopwatch.GetElapsedTime(timed));
             token.ThrowIfCancellationRequested();
+            BrowserReadyForTest?.Invoke(session!.Browser!, page);
             var navigationMs = 0.0;
             for (var view = 1; view <= run.PageViews; view++)
             {
@@ -171,6 +188,7 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
                 else
                 {
                     var response = await AwaitAsync(page.ReloadAsync(new() { WaitUntil = WaitUntilState.Load }), token).ConfigureAwait(false);
+                    if (response?.Status is 644 or 407) throw new PageHttpStatusException(response.Status, response.Url);
                     if (response is null || !response.Ok)
                         throw new InvalidOperationException($"页面加载失败：HTTP {response?.Status}（第 {view}/{run.PageViews} 次访问）。");
                 }
@@ -220,7 +238,14 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
             lock (cacheSync) pending = cacheTasks.ToArray();
             await Task.WhenAll(pending).ConfigureAwait(false);
         }
-        catch (Exception ex) { errors.Add(ex); }
+        catch (Exception ex)
+        {
+            // Classify only main-document browser failures, never failed images/scripts or cleanup messages.
+            var proxyCode = ProxyUnavailableException.BrowserCode(latestDocumentFailure)
+                ?? (stage == "navigation" && ex is PlaywrightException ? ProxyUnavailableException.BrowserCode(ex.Message) : null);
+            errors.Add(!token.IsCancellationRequested && proxyCode is not null
+                ? new ProxyUnavailableException(proxyCode, ex) : ex);
+        }
         finally
         {
             if (page is not null)
@@ -309,23 +334,20 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
         return Task.CompletedTask;
     }
 
-    private async Task ServeAsync(IRoute route, string partition, CancellationToken token)
+    internal async Task ServeAsync(IRoute route, string partition, CancellationToken token)
     {
-        var headers = await AwaitAsync(route.Request.AllHeadersAsync(), token).ConfigureAwait(false);
-        if (route.Request.Method == "GET" && IsCacheableResource(route.Request.ResourceType)
-            && !headers.ContainsKey("cookie") && !headers.ContainsKey("authorization") && !headers.ContainsKey("range"))
+        if (route.Request.Method == "GET" && (IsCacheableResource(route.Request.ResourceType) || IsVideoUrl(route.Request.Url)) && !IsGifUrl(route.Request.Url))
         {
-            var hit = await cache.TryGetAsync(SharedStaticResourceCache.RequestKey(route.Request.Url,
-                new Dictionary<string, string>(headers), partition), token).ConfigureAwait(false);
+            var headers = new Dictionary<string, string>(await AwaitAsync(route.Request.AllHeadersAsync(), token).ConfigureAwait(false));
+            // URL-only reuse is explicitly enabled, independent of request identity.
+            using var hit = await cache.TryGetFileAsync(SharedStaticResourceCache.RequestKey(route.Request.Url, headers, partition), token).ConfigureAwait(false);
             _metrics.CacheLookup(hit is not null);
             if (hit is not null)
             {
                 await route.FulfillAsync(new()
                 {
-                    Status = 200,
-                    ContentType = hit.ContentType,
-                    Headers = hit.Headers,
-                    BodyBytes = hit.Body
+                    Status = hit.Status, ContentType = hit.Headers.GetValueOrDefault("content-type", hit.ContentType),
+                    Headers = hit.Headers, Path = hit.Path
                 }).ConfigureAwait(false);
                 return;
             }
@@ -333,36 +355,44 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
         await route.FallbackAsync().ConfigureAwait(false);
     }
 
-    private async Task RecordAsync(IResponse response, string partition, CancellationToken token)
+    internal async Task RecordAsync(IResponse response, string partition, CancellationToken token)
     {
-        var capturedAt = Stopwatch.GetTimestamp();
         try
         {
-            if (response.Request.Method != "GET" || !IsCacheableResource(response.Request.ResourceType) || response.Status != 200) return;
+            if (response.Request.Method != "GET" || !(IsCacheableResource(response.Request.ResourceType) || IsVideoUrl(response.Request.Url))
+                || response.Status is not (200 or 206) || IsGifUrl(response.Request.Url)) return;
             var headers = new Dictionary<string, string>(await AwaitAsync(response.AllHeadersAsync(), token).ConfigureAwait(false));
             var request = new Dictionary<string, string>(await AwaitAsync(response.Request.AllHeadersAsync(), token).ConfigureAwait(false));
-            var lifetime = SharedStaticResourceCache.PublicLifetime(request, headers);
-            // Unknown/chunked sizes, compressed bodies and media are never buffered into the shared cache.
-            if (lifetime is null || headers.ContainsKey("content-encoding") || headers.ContainsKey("transfer-encoding")
-                || !long.TryParse(headers.GetValueOrDefault("content-length"), out var length)
-                || length is < 1 or > SharedStaticResourceCache.MaxEntryBytes) return;
             var contentType = headers.GetValueOrDefault("content-type", "").Split(';', 2)[0].Trim();
             if (!IsCacheableContentType(contentType)) return;
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-            timeout.CancelAfter(TimeSpan.FromSeconds(2));
+            var key = SharedStaticResourceCache.RequestKey(response.Request.Url, request, partition);
+            using (var existing = await cache.TryGetFileAsync(key, token).ConfigureAwait(false))
+                if (existing is not null) return; // Do not re-capture hits or extend their configured TTL.
+            // Playwright returns the decoded body, including gzip/br and chunked responses.
+            // There is no per-resource size or two-second capture limit; UV cancellation still applies.
             var bodyTask = response.BodyAsync();
             byte[] body;
-            try { body = await bodyTask.WaitAsync(timeout.Token).ConfigureAwait(false); }
+            try { body = await bodyTask.WaitAsync(token).ConfigureAwait(false); }
             catch { _ = bodyTask.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted); throw; }
-            if (body.LongLength != length) return;
-            headers.Remove("content-length");
-            await cache.StoreAsync(SharedStaticResourceCache.RequestKey(response.Request.Url, request, partition),
-                contentType, headers, body, lifetime.Value - Stopwatch.GetElapsedTime(capturedAt), timeout.Token).ConfigureAwait(false);
+            if (!headers.ContainsKey("content-encoding") && long.TryParse(headers.GetValueOrDefault("content-length"), out var length)
+                && body.LongLength != length) return;
+            if (response.Status == 206)
+            {
+                var range = System.Text.RegularExpressions.Regex.Match(headers.GetValueOrDefault("content-range", ""),
+                    @"^bytes (\d+)-(\d+)/(\d+|\*)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (!request.ContainsKey("range") || headers.ContainsKey("content-encoding") || !range.Success
+                    || !long.TryParse(range.Groups[1].Value, out var first) || !long.TryParse(range.Groups[2].Value, out var last)
+                    || last < first || last - first != body.LongLength - 1
+                    || (range.Groups[3].Value != "*" && (!long.TryParse(range.Groups[3].Value, out var total) || last >= total))) return;
+            }
+            foreach (var header in new[] { "content-length", "content-encoding", "transfer-encoding", "connection", "keep-alive",
+                "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade", "content-md5", "digest", "etag", "set-cookie" }) headers.Remove(header);
+            await cache.StoreAsync(key,
+                contentType, headers, body, token, response.Status).ConfigureAwait(false);
         }
         catch (Exception ex) { logger.Debug(ex, "静态缓存记录已放弃"); }
         finally { cache.EndCapture(); }
     }
-
     internal static async Task<bool> CloseContextGracefullyAsync(Func<Task> closeContext, TimeSpan timeout,
         ILogger logger, long taskId, long uvId)
     {
@@ -409,12 +439,28 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
         try { await operation.WaitAsync(token).ConfigureAwait(false); }
         catch { _ = operation.ContinueWith(task => _ = task.Exception, TaskContinuationOptions.OnlyOnFaulted); throw; }
     }
-    private static bool IsCacheableResource(string type) => type is "image" or "stylesheet" or "font";
+    private static bool IsCacheableResource(string type) => type is "image" or "stylesheet" or "script" or "font" or "media";
     private static bool IsCacheableContentType(string type) =>
-        type.StartsWith("image/", StringComparison.OrdinalIgnoreCase) || type.Equals("text/css", StringComparison.OrdinalIgnoreCase)
-        || type.StartsWith("font/", StringComparison.OrdinalIgnoreCase) || type.StartsWith("application/font", StringComparison.OrdinalIgnoreCase)
-        || type.StartsWith("application/x-font", StringComparison.OrdinalIgnoreCase) || type.Equals("application/vnd.ms-fontobject", StringComparison.OrdinalIgnoreCase);
-
+        (type.StartsWith("image/", StringComparison.OrdinalIgnoreCase) && !type.Equals("image/gif", StringComparison.OrdinalIgnoreCase))
+        || type.Equals("text/css", StringComparison.OrdinalIgnoreCase)
+        || type.Equals("application/javascript", StringComparison.OrdinalIgnoreCase)
+        || type.Equals("text/javascript", StringComparison.OrdinalIgnoreCase)
+        || type.Equals("application/x-javascript", StringComparison.OrdinalIgnoreCase)
+        || type.Equals("application/ecmascript", StringComparison.OrdinalIgnoreCase)
+        || type.Equals("text/ecmascript", StringComparison.OrdinalIgnoreCase)
+        || type.StartsWith("font/", StringComparison.OrdinalIgnoreCase)
+        || type.StartsWith("application/font", StringComparison.OrdinalIgnoreCase)
+        || type.StartsWith("application/x-font", StringComparison.OrdinalIgnoreCase)
+        || type.Equals("application/vnd.ms-fontobject", StringComparison.OrdinalIgnoreCase)
+        || type.StartsWith("video/", StringComparison.OrdinalIgnoreCase) || type.StartsWith("audio/", StringComparison.OrdinalIgnoreCase)
+        || type.Equals("application/vnd.apple.mpegurl", StringComparison.OrdinalIgnoreCase)
+        || type.Equals("application/x-mpegurl", StringComparison.OrdinalIgnoreCase)
+        || type.Equals("application/dash+xml", StringComparison.OrdinalIgnoreCase)
+        || type.Equals("application/octet-stream", StringComparison.OrdinalIgnoreCase);
+    private static bool IsVideoUrl(string url) => Uri.TryCreate(url, UriKind.Absolute, out var uri)
+        && new[] { ".mp4", ".webm", ".m3u8", ".mpd", ".ts", ".m4s" }.Contains(Path.GetExtension(uri.AbsolutePath), StringComparer.OrdinalIgnoreCase);
+    private static bool IsGifUrl(string url) => Uri.TryCreate(url, UriKind.Absolute, out var uri)
+        && Uri.UnescapeDataString(uri.AbsolutePath).EndsWith(".gif", StringComparison.OrdinalIgnoreCase);
     internal BrowserTypeLaunchOptions CreateLaunchOptions(BusinessUvRun run, DeviceProfileResult? viewport = null, BrowserIpEnvironment? ipEnvironment = null)
     {
         var device = run.Device;
@@ -426,15 +472,12 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
         var (width, height, scale) = (viewport.CssWidth, viewport.CssHeight, viewport.DeviceScaleFactor);
         var args = new List<string>
         {
-            "--lang=zh-CN", "--no-first-run", "--no-default-browser-check", "--disable-background-networking",
-            "--disable-component-update", "--disable-sync", "--ignore-certificate-errors", "--enable-unsafe-swiftshader",
+            //"--blink-settings=imagesEnabled=false",
+            "--lang=zh-CN", "--no-first-run",
             "--show-avatar-button=never", "--hide-bad-flags", "--hide-crashed-bubble",
-            "--force-prefers-no-reduced-motion",
             // 出口 IP 泄露兜底：只允许走代理的 UDP，直连时也不暴露真实内网地址。
             "--webrtc-ip-handling-policy=disable_non_proxied_udp",
             "--touch-events=enabled", "--max-touch-points=5",
-            "--netinfo-type=4g", "--netinfo-effective=4g", "--netinfo-rtt=200",
-            "--enable-battery-charging=0", "--battery-level=0.85",
             "--screen-color-depth=24", "--window-position=0,0",
             $"--window-size={width},{height}",
             $"--device-pixel-ratio={scale.ToString(CultureInfo.InvariantCulture)}",

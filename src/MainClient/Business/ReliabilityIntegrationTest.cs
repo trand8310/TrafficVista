@@ -47,39 +47,19 @@ internal static class ReliabilityIntegrationTest
                 PageLoadingDelay = scenario == "pageDelay" ? 60m : 0m };
             var run = new BusinessUvRun(1, 1, new(server.Url + "page"), directory, TestDevice(), null, options,
                 scenario is "pageDelay" or "normal" ? TimeSpan.Zero : TimeSpan.FromSeconds(60), 1, null);
+            var ready = new TaskCompletionSource<(IBrowser Browser, IPage Page)>(TaskCreationOptions.RunContinuationsAsynchronously);
+            runner.BrowserReadyForTest = (browser, page) => ready.TrySetResult((browser, page));
             var running = runner.RunAsync(run, requested.Token);
             if (scenario != "normal")
             {
-                var portFile = Path.Combine(directory, "chrome-profile", "DevToolsActivePort");
-                string[] endpoint = [];
-                await WaitUntilAsync(() =>
-                {
-                    try { if (File.Exists(portFile)) endpoint = File.ReadAllLines(portFile); }
-                    catch (IOException) { }
-                    return endpoint.Length >= 2;
-                });
-                var baseUrl = "http://127.0.0.1:" + endpoint[0];
-                string? pageId = null;
-                using var discover = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-                while (pageId is null)
-                {
-                    var list = JArray.Parse(await client.GetStringAsync(baseUrl + "/json/list", discover.Token));
-                    pageId = list.OfType<JObject>().FirstOrDefault(t => t.Value<string>("type") == "page"
-                        && t.Value<string>("url") == run.Target.AbsoluteUri)?.Value<string>("id");
-                    if (pageId is null) await Task.Delay(50, discover.Token);
-                }
+                var active = await ready.Task.WaitAsync(TimeSpan.FromSeconds(30));
+                await WaitUntilAsync(() => active.Page.Url == run.Target.AbsoluteUri);
                 // 本地页面提交后留出DOM检查时间，确保关闭发生于普通60秒等待中。
                 await Task.Delay(1500);
                 var closeTime = Stopwatch.StartNew();
                 if (scenario == "cancel") requested.Cancel();
-                else if (scenario == "browser")
-                {
-                    using var socket = new System.Net.WebSockets.ClientWebSocket();
-                    await socket.ConnectAsync(new Uri("ws://127.0.0.1:" + endpoint[0] + endpoint[1]), CancellationToken.None);
-                    await socket.SendAsync(Encoding.UTF8.GetBytes("{\"id\":1,\"method\":\"Browser.close\"}"),
-                        System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
-                }
-                else await client.GetStringAsync(baseUrl + "/json/close/" + pageId);
+                else if (scenario == "browser") await active.Browser.CloseAsync();
+                else await active.Page.CloseAsync();
                 try { await running.WaitAsync(TimeSpan.FromSeconds(10)); throw new InvalidOperationException("关闭后的UV不应成功：" + scenario); }
                 catch (OperationCanceledException) when (scenario == "cancel" && requested.IsCancellationRequested) { }
                 catch (AggregateException) when (scenario != "cancel") { }
@@ -475,37 +455,26 @@ internal static class ReliabilityIntegrationTest
 
     private static async Task VerifyCacheAsync(BusinessOptions business, ILogger logger, StringBuilder report)
     {
-        using var cache = new SharedStaticResourceCache(business, logger);
-        var request = new Dictionary<string, string> { ["user-agent"] = "a" };
-        var publicHeaders = new Dictionary<string, string> { ["cache-control"] = "public, max-age=60" };
-        Expect(SharedStaticResourceCache.PublicLifetime(request, publicHeaders) == TimeSpan.FromSeconds(60), "public cache policy");
-        var aged = new Dictionary<string, string>(publicHeaders) { ["age"] = "60" };
-        Expect(SharedStaticResourceCache.PublicLifetime(request, aged) is null, "already aged response is stale");
-        aged["age"] = "0"; aged["date"] = DateTimeOffset.UtcNow.AddMinutes(-2).ToString("r");
-        Expect(SharedStaticResourceCache.PublicLifetime(request, aged) is null, "old Date makes response stale");
-        Expect(SharedStaticResourceCache.PublicLifetime(request, new Dictionary<string, string>
-            { ["cache-control"] = "public, max-age=60, s-maxage=0" }) is null, "shared cache lifetime overrides max-age");
-        foreach (var directive in new[] { "private, max-age=60", "public, no-store, max-age=60", "public, no-cache, max-age=60", "public, private=\"x-secret\", max-age=60" })
-            Expect(SharedStaticResourceCache.PublicLifetime(request, new Dictionary<string, string> { ["cache-control"] = directive }) is null, "private/no-store/no-cache bypass");
-        var varied = new Dictionary<string, string>(publicHeaders) { ["vary"] = "X-Custom" };
-        Expect(SharedStaticResourceCache.PublicLifetime(request, varied) is null, "unknown Vary bypass");
-        request["cookie"] = "secret";
-        Expect(SharedStaticResourceCache.PublicLifetime(request, publicHeaders) is null, "cookie isolation");
-        request.Remove("cookie");
+        var clock = new StaticCacheIntegrationTest.CacheClock();
+        using var cache = new SharedStaticResourceCache(business, logger, clock);
+        var request = new Dictionary<string, string> { ["user-agent"] = "a", ["cookie"] = "secret" };
         var key = SharedStaticResourceCache.RequestKey("http://asset.test/", request, "direct");
-        var other = SharedStaticResourceCache.RequestKey("http://asset.test/", request, "proxy-b");
-        Expect(key != other, "proxy partition");
+        request["cookie"] = "other-identity";
+        request["user-agent"] = "b";
+        Expect(key == SharedStaticResourceCache.RequestKey("http://asset.test/", request, "proxy-b") && !key.Contains("secret"), "URL-only reuse across identities and proxies");
+        var other = SharedStaticResourceCache.RequestKey("http://asset.test/?v=2", request, "direct");
+        Expect(key != other, "URL query changes key");
         var bodies = Enumerable.Range(1, 32).Select(i => Enumerable.Repeat((byte)i, 1024).ToArray()).ToArray();
-        await Task.WhenAll(bodies.Select(body => cache.StoreAsync(key, "image/png", new() { ["x-test"] = body[0].ToString() }, body, TimeSpan.FromMinutes(1))));
+        await Task.WhenAll(bodies.Select(body => cache.StoreAsync(key, "image/png", new() { ["x-test"] = body[0].ToString() }, body)));
         var hit = await cache.TryGetAsync(key);
         Expect(hit is not null && hit.Body.All(b => b == byte.Parse(hit.Headers["x-test"])), "atomic metadata/body concurrent writes");
-        await cache.StoreAsync("expired", "image/png", new(), Png, TimeSpan.FromMilliseconds(10));
-        await Task.Delay(30);
-        Expect(await cache.TryGetAsync("expired") is null && await cache.TryGetAsync(other) is null, "TTL and partition miss");
-        await cache.StoreAsync("large", "image/png", new(), new byte[SharedStaticResourceCache.MaxEntryBytes + 1], TimeSpan.FromMinutes(1));
-        Expect(await cache.TryGetAsync("large") is null, "large entry bypass");
+        await cache.StoreAsync("expired", "image/png", new(), Png);
+        clock.Advance(TimeSpan.FromHours(business.StaticCacheTtlHours));
+        Expect(await cache.TryGetAsync("expired") is null && await cache.TryGetAsync(other) is null, "configured TTL and URL miss");
+        await cache.StoreAsync("large", "image/png", new(), new byte[4 * 1024 * 1024]);
+        Expect((await cache.TryGetAsync("large"))?.Body.Length == 4 * 1024 * 1024, "large entry retained without per-resource size cap");
         cache.Clear();
-        report.AppendLine("PASS public/private/Vary/Cookie 缓存策略、出口隔离、并发原子发布、TTL 和大小保护");
+        report.AppendLine("PASS URL跨身份共享、查询参数区分、并发原子发布、配置TTL及大资源缓存");
     }
 
     private static async Task VerifyConsumerAsync(BusinessOptions business, ILogger logger, StringBuilder report)

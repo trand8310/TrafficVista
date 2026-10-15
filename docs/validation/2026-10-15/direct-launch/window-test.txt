@@ -1,0 +1,5 @@
+PASS
+模式=可见，启动默认页面=0，业务页面目标=1，可见窗口=1
+模式=headless，启动默认页面=0，业务页面目标=1，可见窗口=0
+直接启动无默认页面，一个 UV 只有一个业务页面；可见/隐藏模式、双UV Cookie/localStorage隔离、关闭互不影响、启动失败/取消及自有进程清理通过；临时profile由Playwright管理。
+输出目录：F:\codex\TrafficVista\src\Build\demo-output\window-tests\6acdb9cefb5143c6bf3e3c1ca66ea346

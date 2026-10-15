@@ -43,10 +43,11 @@ internal static class InitialPageNavigation
                 timedOut = true;
             }
             token.ThrowIfCancellationRequested();
+            if (document?.Status == 644) throw new PageHttpStatusException(644, document.Url);
             if (!string.IsNullOrWhiteSpace(networkFailure))
                 throw new InvalidOperationException("首次页面主文档网络请求失败：" + networkFailure);
             if (document?.Status == 407)
-                throw new InvalidOperationException("首次页面代理认证失败：HTTP 407。");
+                throw new PageHttpStatusException(407, document.Url);
             while (true)
             {
                 token.ThrowIfCancellationRequested();
@@ -54,6 +55,8 @@ internal static class InitialPageNavigation
                 // 导航超时后仍做一次最多2秒的检查，以接纳已提交的慢页面。
                 // 独立检查上限不随渲染等待的最后几十毫秒缩短，否则会把正常控制通道响应误判超时。
                 var state = await PageContentInspector.InspectAsync(page, TimeSpan.FromSeconds(2), token).ConfigureAwait(false);
+                if (document?.Status == 644) throw new PageHttpStatusException(644, document.Url);
+                if (document?.Status == 407) throw new PageHttpStatusException(407, document.Url);
                 if (!string.IsNullOrWhiteSpace(networkFailure))
                     throw new InvalidOperationException("首次页面主文档网络请求失败：" + networkFailure);
                 if (document?.Status == 407 || (!state.Transient && state.IsError))

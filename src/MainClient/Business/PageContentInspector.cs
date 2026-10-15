@@ -92,6 +92,8 @@ internal static class PageContentInspector
         while (true)
         {
             var remaining = TimeSpan.FromSeconds(3) - System.Diagnostics.Stopwatch.GetElapsedTime(started);
+            if (status() == 644) throw new PageHttpStatusException(644, page.Url);
+            if (status() == 407) throw new PageHttpStatusException(407, page.Url);
             if (remaining <= TimeSpan.Zero)
                 throw new InvalidOperationException($"浏览结束后3秒内未检测到可见页面内容，URL={page.Url}，HTTP={status()}。");
             var state = await InspectAsync(page, remaining < TimeSpan.FromSeconds(2) ? remaining : TimeSpan.FromSeconds(2), token).ConfigureAwait(false);

@@ -1,0 +1,6 @@
+PASS
+非GIF图片/CSS/JS/字体/视频跨UV命中；3MiB图片、3MiB解压后JS不受1MiB限制；gzip解码回填与chunked无Content-Length的CSS加载正常。
+GIF扩展名（含大写和查询参数）、image/gif响应及伪装为PNG的GIF文件头均不入库；Cookie A/B脚本内容隔离且同一Cookie可复用。
+字体正常加载并复用；视频200与两个不同Range的206分别缓存，状态/Content-Range/正文匹配；浏览器进程归零。
+磁盘文件租约在覆盖/清空期间保护活跃读取；超过总预算的单个文件仍保留，取消写入不发布残缺文件。
+输出目录：F:\codex\TrafficVista\.audit-build\cache-expanded-out\demo-output\static-cache-tests\75f1e1a6ee0645189763fc3a02db3cfc

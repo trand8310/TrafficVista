@@ -6,6 +6,10 @@
 
 新版验证：两项各12UV填满24个共享名额，独立任务间隔、全局并发硬上限、历史异常内存峰值不降低并发、50 Worker共享2个名额、已获取任务在后续承压时继续执行、等待取消恢复、启动限速及释放均通过。配置/表单与本地真实Chrome完整回归通过；共享缓存用例使用CSS验证跨UV命中（当前浏览器环境未发起原图片用例的请求），未降低命中断言。1/2/4/8并发真实Chrome基准通过，但本地机器与页面不代表正式机器吞吐，也不保证每分钟500UV。
 
+2026-10-15浏览器启动方式更新：业务浏览器改用 LaunchAsync 直接启动，保留每 UV 独立 Chrome 进程、Context 和新临时 profile，同 UV 多 PV 共享页面与会话。Playwright管理通信和临时profile清理，不再等待DevToolsActivePort或通过ConnectOverCDPAsync附加。每UV不复用身份数据，图片拦截和共享缓存开关保持原配置。原Windows Job清理与进程统计保留：通过当前浏览器CDP取得主PID，再接管该进程的启动辅助进程；沙箱层级冲突时使用独立嵌套Job。多Job峰值之和为保守内存上界。新增browserLaunchMs/browserSetupMs计时。启动API不支持token，取消等待有界启动和进程接管后再清理。曾实测LaunchPersistentContextAsync，但当前定制Chrome下首次慢页面检查不稳定，因此最终选择LaunchAsync和独立Context，导航/内容判断代码保持原实现。后文挂起启动、单Job和自有profile清理为历史实现，以本段及src/README.md为准。
+直接启动验证：构建0警告0错误；完整离线可靠性、单窗口/双UV Cookie与localStorage隔离、启动失败/取消、桌面所属进程计数、代理环境、浏览器关闭与无导出两PV回归均通过。报告见 [direct-launch](docs/validation/2026-10-15/direct-launch/reliability-test.txt)。
+
+2026-10-15静态缓存最终策略（以本段及src/README.md为准）：非GIF图片、CSS、JS、字体、视频正常加载并缓存，无单资源大小限制。普通资源仅用完整URL的SHA256，跨Cookie/UA/代理出口共享；视频Range/If-Range单独区分，合法206校验后回填。保留浏览器UV会话隔离，回填删除Set-Cookie。有效期仅按StaticCacheTtlHours从原写入时间计算，命中不续期，重启修改时长后现有条目也使用新时长；忽略服务器缓存控制/时间/协商策略。v4独立目录避免复用旧键，原子正文/元数据及读取租约继续保护文件，容量软预算仍可提前淘汰。GIF扩展名/MIME/文件头均排除；支持解压正文、chunked与未知长度，框架仍会缓冲正文。关闭共享缓存后使用Chrome原生缓存。专项测试覆盖跨身份同URL复用、服务器禁止缓存/短有效期覆盖、时长边界/重启配置、视频完整与不同Range、GIF排除、大文件及取消/租约；完整回归同时覆盖UV会话隔离。验证报告见[专项测试](docs/validation/2026-10-15/static-cache-v4/static-cache-test.txt)和[完整回归](docs/validation/2026-10-15/static-cache-v4/reliability-test.txt)。
 ## 已落地的客户端改进
 
 2026-10-15屏幕匹配完善：真实物理分辨率仍沿用竖屏归一化，统一按同一DPR换算两边，不再单独吸附CSS宽度。取消旧CSS高度600及普通手机比例硬拒绝，覆盖低分辨率、宽比例/方屏/平板、4K，并在优先候选不适合时扩展搜索。设备可选devicePixelRatio/deviceScaleFactor/dpr优先使用，缺失才估算；日志明确DprSource和匹配策略，正常方屏不再警告，超出覆盖范围才回退并说明原因。物理分辨率不能唯一还原设备真实缩放。84组一致性、设备DPR贯通、真实Chrome低分辨率/平板/方屏/DPR3以及完整可靠性回归通过，未请求生产接口。详见docs/validation/2026-10-15。
@@ -150,3 +154,7 @@ Windows 子进程先挂起创建、加入 Job 再恢复；Job 负责所属进程
 状态栏/桌面入口已接入：四项状态含应用运行状态、逻辑CPU/趋势使用率、物理内存/使用率、所属Chrome Job进程数；悬停显示UV会话，不扫描其他Chrome。开机启动通过后台STA创建当前用户快捷方式，携带 --auto-start，创建后打开启动目录；窗体初始化后自动触发开始按钮且仅触发一次。清理同目标的旧Startup快捷方式、Run/RunOnce和开机/登录计划任务，权限失败单独记日志；不根据名称删除其它程序或其它安装路径。临时快捷方式位于系统临时目录，重复创建幂等。应用目录通过资源管理器打开。右侧摘要按用户缩小后的布局压缩为短行，完整错误保留悬停。[desktop-test.txt](docs/validation/2026-10-14/desktop-test.txt) 在隔离目录验证shortcut目标/参数/工作目录/更新/失败、旧快捷方式清理及其它程序保留，真实Chrome所属进程与清理归零；[form-test.txt](docs/validation/2026-10-14/form-test.txt) 使用空任务HTTP桩验证自动启动按钮及只触发一次。真实Windows启动目录、注册表和计划任务未在测试中改动；本机4逻辑核，未在真实多处理器组硬件验收。构建0警告0错误。
 
 共享缓存的 s-maxage 优先级、Age/Date、新鲜度及 private/Vary 处理依据 HTTP 缓存规范；实现采用更保守的资源和响应白名单，并未实现通用 HTTP 缓存代理的全部功能。[RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html)。
+
+2026-10-15 HTTP 644任务保护：按同任务UV完成顺序连续3次主文档644，停止后续投递并中断投递等待，已投UV继续完成；成功或其他错误清零，计数不跨任务/消费轮次。导航状态用类型化异常穿过AggregateException，避免按字符串误判；失败摘要标记consecutive-http-644。专项覆盖阈值/重置、同ID新运行、其他任务继续、在途UV保留、许可释放、未投摘要和真实Chrome 644/200导航。报告见[http644-test.txt](docs/validation/2026-10-15/http644/http644-test.txt)。
+
+2026-10-15代理不可用停止投递：仅代理模式的主文档明确代理连接/隧道/SOCKS/认证/证书/协议错误或407一次即停止该任务后续UV，已投UV正常完成；通用超时/重置/DNS/502/504不作代理失效证明，保留连续3次644规则。类型化错误穿过清理聚合异常，任务摘要保留proxy-unavailable原因。扩展专项覆盖全部明确错误码、407、直连/通用错误排除及真实Chrome连接本地已关闭代理端口，确认只派发1/5、余下4个停止且浏览器/许可归零。[专项报告](docs/validation/2026-10-15/proxy-unavailable/http644-test.txt)。错误分类参考[Chromium网络错误定义](https://raw.githubusercontent.com/chromium/chromium/main/net/base/net_error_list.h)。
