@@ -50,61 +50,91 @@ internal sealed class ChromeProcessJob : IDisposable
 
     // Include startup helpers omitted by CDP (for example crash handlers).
     // Only descendants of the browser PID are selected, never processes matched by name.
-    internal void AttachExistingProcesses()
+    internal void AttachExistingProcesses(Func<string, IDisposable>? trackPhase = null)
     {
-        using var snapshot = CreateToolhelp32Snapshot(2, 0);
-        if (snapshot.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
-        var entry = new ProcessEntry { Size = (uint)Marshal.SizeOf<ProcessEntry>() };
-        var parents = new Dictionary<int, int>();
-        if (!Process32FirstW(snapshot, ref entry)) throw new Win32Exception(Marshal.GetLastWin32Error());
-        do { parents[(int)entry.Id] = (int)entry.ParentId; } while (Process32NextW(snapshot, ref entry));
-        var processIds = new List<int> { Process.Id };
-        for (var index = 0; index < processIds.Count; index++)
-            processIds.AddRange(parents.Where(p => p.Value == processIds[index] && !processIds.Contains(p.Key)).Select(p => p.Key));
-        foreach (var id in processIds)
+        var phase = "launchProcessSnapshot";
+        try
         {
-            if (id == Process.Id) continue;
-            try
+            Dictionary<int, int> parents;
+            List<int> processIds;
+            using (trackPhase?.Invoke("launchProcessSnapshot"))
             {
-                using var child = Process.GetProcessById(id);
-                // A snapshot can contain an older process whose recorded parent PID has
-                // since been reused by this browser. It is not ours; neither attach nor kill it.
-                if (child.StartTime < Process.StartTime) continue;
-                var alreadyOwned = false;
-                foreach (var ownedJob in AllJobs)
-                {
-                    if (!IsProcessInJob(child.Handle, ownedJob, out alreadyOwned))
-                        throw new Win32Exception(Marshal.GetLastWin32Error());
-                    if (alreadyOwned) break;
-                }
-                if (!alreadyOwned && !AssignProcessToJobObject(_job, child.Handle))
-                {
-                    var error = Marshal.GetLastWin32Error();
-                    if (child.HasExited) continue;
-                    if (error != 5) throw new Win32Exception(error);
-                    // Chromium sandbox jobs created before attachment can have an incompatible
-                    // hierarchy with the browser job. Give these processes their own nested job.
-                    var nested = CreateJobObjectW(0, null);
-                    try
-                    {
-                        var limits = new ExtendedLimits { Basic = new BasicLimits { LimitFlags = 0x2000 } };
-                        if (nested.IsInvalid || !SetInformationJobObject(nested, 9, ref limits, (uint)Marshal.SizeOf<ExtendedLimits>())
-                            || !AssignProcessToJobObject(nested, child.Handle))
-                            throw new Win32Exception(Marshal.GetLastWin32Error());
-                        lock (RegistrySync) _startupJobs.Add(nested);
-                    }
-                    catch { nested.Dispose(); throw; }
-                }
+                using var snapshot = CreateToolhelp32Snapshot(2, 0);
+                if (snapshot.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+                var entry = new ProcessEntry { Size = (uint)Marshal.SizeOf<ProcessEntry>() };
+                parents = new Dictionary<int, int>();
+                if (!Process32FirstW(snapshot, ref entry)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                do { parents[(int)entry.Id] = (int)entry.ParentId; } while (Process32NextW(snapshot, ref entry));
+                processIds = FindDescendants(Process.Id, parents);
             }
-            catch (ArgumentException) { } // The reported process has already exited.
+            phase = "launchChildProcessAttach";
+            using var attachTiming = trackPhase?.Invoke("launchChildProcessAttach");
+            foreach (var id in processIds)
+            {
+                if (id == Process.Id) continue;
+                try
+                {
+                    using var child = Process.GetProcessById(id);
+                    // A snapshot can contain an older process whose recorded parent PID has
+                    // since been reused by this browser. It is not ours; neither attach nor kill it.
+                    if (child.StartTime < Process.StartTime) continue;
+                    var alreadyOwned = false;
+                    foreach (var ownedJob in AllJobs)
+                    {
+                        if (!IsProcessInJob(child.Handle, ownedJob, out alreadyOwned))
+                            throw new Win32Exception(Marshal.GetLastWin32Error());
+                        if (alreadyOwned) break;
+                    }
+                    if (!alreadyOwned && !AssignProcessToJobObject(_job, child.Handle))
+                    {
+                        var error = Marshal.GetLastWin32Error();
+                        if (child.HasExited) continue;
+                        if (error != 5) throw new Win32Exception(error);
+                        // Chromium sandbox jobs created before attachment can have an incompatible
+                        // hierarchy with the browser job. Give these processes their own nested job.
+                        var nested = CreateJobObjectW(0, null);
+                        try
+                        {
+                            var limits = new ExtendedLimits { Basic = new BasicLimits { LimitFlags = 0x2000 } };
+                            if (nested.IsInvalid || !SetInformationJobObject(nested, 9, ref limits, (uint)Marshal.SizeOf<ExtendedLimits>())
+                                || !AssignProcessToJobObject(nested, child.Handle))
+                                throw new Win32Exception(Marshal.GetLastWin32Error());
+                            lock (RegistrySync) _startupJobs.Add(nested);
+                        }
+                        catch { nested.Dispose(); throw; }
+                    }
+                }
+                catch (ArgumentException) { } // The reported process has already exited.
+            }
         }
+        catch (Exception ex) { ex.Data["BrowserStartupPhase"] ??= phase; throw; }
+    }
+
+    // Build the parent index once instead of rescanning every system process for each descendant.
+    // A fresh snapshot is retained for every launch so pre-attachment children are never missed by a stale cache.
+    internal static List<int> FindDescendants(int root, IReadOnlyDictionary<int, int> parents)
+    {
+        var children = new Dictionary<int, List<int>>();
+        foreach (var (id, parent) in parents)
+        {
+            if (!children.TryGetValue(parent, out var siblings)) children.Add(parent, siblings = []);
+            siblings.Add(id);
+        }
+        var result = new List<int> { root };
+        var visited = new HashSet<int> { root };
+        for (var index = 0; index < result.Count; index++)
+            if (children.TryGetValue(result[index], out var descendants))
+                foreach (var id in descendants)
+                    if (visited.Add(id)) result.Add(id);
+        return result;
     }
 
     internal void Kill() { foreach (var job in AllJobs) if (!job.IsClosed) TerminateJobObject(job, 1); }
     public void Dispose()
     { lock (RegistrySync) { Registry.Remove(this); foreach (var job in AllJobs) job.Dispose(); Process.Dispose(); } }
 
-    [StructLayout(LayoutKind.Sequential)] private struct BasicLimits
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BasicLimits
     {
         public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
         public uint LimitFlags;
@@ -113,20 +143,24 @@ internal sealed class ChromeProcessJob : IDisposable
         public UIntPtr Affinity;
         public uint PriorityClass, SchedulingClass;
     }
-    [StructLayout(LayoutKind.Sequential)] private struct IoCounters
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoCounters
     { public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount, ReadTransferCount, WriteTransferCount, OtherTransferCount; }
-    [StructLayout(LayoutKind.Sequential)] private struct ExtendedLimits
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ExtendedLimits
     {
         public BasicLimits Basic;
         public IoCounters Io;
         public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
     }
-    [StructLayout(LayoutKind.Sequential)] private struct Accounting
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Accounting
     {
         public long TotalUserTime, TotalKernelTime, ThisPeriodUserTime, ThisPeriodKernelTime;
         public uint TotalPageFaults, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
     }
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] private struct ProcessEntry
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ProcessEntry
     {
         public uint Size, Usage, Id;
         public UIntPtr DefaultHeap;
@@ -137,22 +171,30 @@ internal sealed class ChromeProcessJob : IDisposable
     }
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern SafeFileHandle CreateToolhelp32Snapshot(uint flags, uint processId);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool Process32FirstW(SafeFileHandle snapshot, ref ProcessEntry entry);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool Process32NextW(SafeFileHandle snapshot, ref ProcessEntry entry);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateJobObjectW(nint attributes, string? name);
-    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetInformationJobObject(SafeFileHandle job, int infoClass, ref ExtendedLimits info, uint length);
-    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool AssignProcessToJobObject(SafeFileHandle job, nint process);
-    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool IsProcessInJob(nint process, SafeFileHandle job, [MarshalAs(UnmanagedType.Bool)] out bool result);
-    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool TerminateJobObject(SafeFileHandle job, uint exitCode);
-    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool QueryInformationJobObject(SafeFileHandle job, int infoClass, out ExtendedLimits info, uint length, nint returnLength);
-    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool QueryInformationJobObject(SafeFileHandle job, int infoClass, out Accounting info, uint length, nint returnLength);
 }

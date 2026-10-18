@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Newtonsoft.Json.Linq;
 using Serilog;
 using TrafficVista.Configuration;
@@ -11,10 +12,13 @@ namespace TrafficVista.Scheduling.Producers;
 public sealed class HttpTaskSource(HttpClient client, ILogger logger, BusinessOptions? business = null) : ITaskSource
 {
     private TrafficVistaOptions _options = new();
+    private readonly TaskFetchDiagnostics _diagnostics = new();
+    public TaskFetchSnapshot Snapshot => _diagnostics.Snapshot;
     public void Configure(TrafficVistaOptions options)
     {
         _ = BuildRequestUri(options);
         _options = options with { };
+        _diagnostics.Reset();
     }
 
     public static Uri BuildRequestUri(TrafficVistaOptions options)
@@ -38,31 +42,59 @@ public sealed class HttpTaskSource(HttpClient client, ILogger logger, BusinessOp
     public async Task<IReadOnlyList<TaskEnvelope>> FetchAsync(CancellationToken token)
     {
         var uri = BuildRequestUri(_options);
-        using var response = await client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
-        const int maxBytes = 4 * 1024 * 1024;
-        if (response.Content.Headers.ContentLength > maxBytes) throw new InvalidDataException("任务响应超过 4 MB。");
-        await using var stream = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
-        using var buffer = new MemoryStream();
-        var bytes = new byte[8192];
-        int read;
-        while ((read = await stream.ReadAsync(bytes, token).ConfigureAwait(false)) > 0)
+        var request = _diagnostics.Begin();
+        var started = Stopwatch.GetTimestamp();
+        int? status = null;
+        logger.Information("任务接口请求开始，Request={Request}，TaskName={TaskName}，Host={Host}", request, _options.TaskName, uri.Host);
+        try
         {
-            if (buffer.Length + read > maxBytes) throw new InvalidDataException("任务响应超过 4 MB。");
-            await buffer.WriteAsync(bytes.AsMemory(0, read), token).ConfigureAwait(false);
+            using var response = await client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+            var headersMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            status = (int)response.StatusCode;
+            _diagnostics.SetStage("检查HTTP状态");
+            response.EnsureSuccessStatusCode();
+            _diagnostics.SetStage("读取响应正文");
+            const int maxBytes = 4 * 1024 * 1024;
+            if (response.Content.Headers.ContentLength > maxBytes) throw new InvalidDataException("任务响应超过 4 MB。");
+            await using var stream = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
+            using var buffer = new MemoryStream();
+            var bytes = new byte[8192];
+            int read;
+            while ((read = await stream.ReadAsync(bytes, token).ConfigureAwait(false)) > 0)
+            {
+                if (buffer.Length + read > maxBytes) throw new InvalidDataException("任务响应超过 4 MB。");
+                await buffer.WriteAsync(bytes.AsMemory(0, read), token).ConfigureAwait(false);
+            }
+            var bodyMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds - headersMs;
+            _diagnostics.SetStage("解析任务响应");
+            IReadOnlyList<TaskEnvelope> result;
+            try { result = ParseResponse(buffer.ToArray()); }
+            catch (Exception)
+            {
+                var recovery = Path.GetFullPath((business ?? new()).RecoveryRoot, AppContext.BaseDirectory);
+                Directory.CreateDirectory(recovery);
+                await File.WriteAllBytesAsync(Path.Combine(recovery, Guid.NewGuid().ToString("N") + ".response.json"),
+                    buffer.ToArray(), CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
+            var elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            _diagnostics.Finish(result.Count, status, elapsed, null, false);
+            logger.Information("任务接口请求完成，Request={Request}，HTTP={Status}，Result={Result}，Count={Count}，ElapsedMs={ElapsedMs:F0}，HeadersMs={HeadersMs:F0}，BodyMs={BodyMs:F0}，Bytes={Bytes}",
+                request, status, result.Count == 0 ? "无可用任务" : "有任务", result.Count, elapsed, headersMs, bodyMs, buffer.Length);
+            return result;
         }
-        IReadOnlyList<TaskEnvelope> result;
-        try { result = ParseResponse(buffer.ToArray()); }
-        catch (Exception)
+        catch (Exception ex)
         {
-            var recovery = Path.GetFullPath((business ?? new()).RecoveryRoot, AppContext.BaseDirectory);
-            Directory.CreateDirectory(recovery);
-            await File.WriteAllBytesAsync(Path.Combine(recovery, Guid.NewGuid().ToString("N") + ".response.json"),
-                buffer.ToArray(), CancellationToken.None).ConfigureAwait(false);
+            var stage = _diagnostics.Snapshot.Stage;
+            var elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            var interrupted = ex is OperationCanceledException && token.IsCancellationRequested;
+            _diagnostics.Finish(null, status, elapsed, ex.Message, interrupted);
+            if (interrupted)
+                logger.Information("任务接口请求中断（取消或超时），Request={Request}，HTTP={Status}，Stage={Stage}，ElapsedMs={ElapsedMs:F0}", request, status, stage, elapsed);
+            else
+                logger.Warning(ex, "任务接口请求失败，Request={Request}，HTTP={Status}，Stage={Stage}，ElapsedMs={ElapsedMs:F0}", request, status, stage, elapsed);
             throw;
         }
-        logger.Debug("任务提取完成，TaskName={TaskName}，Count={Count}", _options.TaskName, result.Count);
-        return result;
     }
 
     public static IReadOnlyList<TaskEnvelope> ParseResponse(ReadOnlyMemory<byte> json)

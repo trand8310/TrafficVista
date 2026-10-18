@@ -57,20 +57,24 @@ public sealed class TrafficVistaSettings : IOptions<TrafficVistaOptions>
             ?? ChromeStartup.MaxConcurrentStarts;
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(MaxConcurrentBrowserStarts);
         BrowserStartIntervalMilliseconds = GetSection(defaults, "Browser")?
-            .GetValue("StartIntervalMilliseconds", StringComparison.OrdinalIgnoreCase)?.ToObject<int>() ?? 100;
+            .GetValue("StartIntervalMilliseconds", StringComparison.OrdinalIgnoreCase)?.ToObject<int>() ?? 0;
         if (BrowserStartIntervalMilliseconds is < 0 or > 60000)
             throw new InvalidDataException("Browser:StartIntervalMilliseconds 必须在0～60000毫秒之间。");
         var merged = (JObject?)GetSection(defaults, TrafficVistaOptions.SectionName)?.DeepClone() ?? new JObject();
         var netMerged = (JObject?)GetSection(defaults, NetOptions.SectionName)?.DeepClone() ?? new JObject();
+        JObject? userUiOptions = null;
         if (File.Exists(UserFilePath))
         {
             var user = JsonData.ParseObject(File.ReadAllText(UserFilePath));
             if (GetSection(user, TrafficVistaOptions.SectionName) is { } userOptions)
+            {
+                userUiOptions = userOptions;
                 merged.Merge(userOptions, new JsonMergeSettings
                 {
                     PropertyNameComparison = StringComparison.OrdinalIgnoreCase,
                     MergeArrayHandling = MergeArrayHandling.Replace
                 });
+            }
             // 用户文件可覆盖 Net：所选供应商（DefaultVendor）、各家 URL 等；固定限制仍以基础文件为准合并。
             if (GetSection(user, NetOptions.SectionName) is { } userNet)
                 netMerged.Merge(userNet, new JsonMergeSettings
@@ -81,9 +85,23 @@ public sealed class TrafficVistaSettings : IOptions<TrafficVistaOptions>
         }
         Net = netMerged.ToObject<NetOptions>() ?? new();
         Net.Validate();
-        // 旧版本只有Business:MaxConcurrentTasks；首次打开新界面沿用旧值，保存后由界面字段管理。
-        if (merged.GetValue(nameof(TrafficVistaOptions.TaskWorkerCount), StringComparison.OrdinalIgnoreCase) is null)
-            merged[nameof(TrafficVistaOptions.TaskWorkerCount)] = Business.MaxConcurrentTasks;
+        // 合并为单一任务并发数；旧双字段配置优先保留实际的任务工作者数量。
+        var legacyWorkers = userUiOptions?.GetValue("TaskWorkerCount", StringComparison.OrdinalIgnoreCase);
+        if (legacyWorkers is not null)
+            merged[nameof(TrafficVistaOptions.MaxConcurrency)] = legacyWorkers.DeepClone();
+        else if (userUiOptions?.GetValue(nameof(TrafficVistaOptions.MaxConcurrency), StringComparison.OrdinalIgnoreCase) is null
+            && merged.GetValue("TaskWorkerCount", StringComparison.OrdinalIgnoreCase) is { } defaultWorkers)
+            merged[nameof(TrafficVistaOptions.MaxConcurrency)] = defaultWorkers.DeepClone();
+        else if (merged.GetValue(nameof(TrafficVistaOptions.MaxConcurrency), StringComparison.OrdinalIgnoreCase) is null)
+            merged[nameof(TrafficVistaOptions.MaxConcurrency)] = Business.MaxConcurrentTasks;
+        var modeKey = nameof(TrafficVistaOptions.JavaScriptCacheMode);
+        if (userUiOptions?.GetValue(modeKey, StringComparison.OrdinalIgnoreCase) is null)
+        {
+            var legacyStrict = userUiOptions?.GetValue("StrictJavaScriptUrlCache", StringComparison.OrdinalIgnoreCase)
+                ?? (merged.GetValue(modeKey, StringComparison.OrdinalIgnoreCase) is null
+                    ? merged.GetValue("StrictJavaScriptUrlCache", StringComparison.OrdinalIgnoreCase) : null);
+            if (legacyStrict is not null) merged[modeKey] = legacyStrict.Value<bool>() ? 2 : 3;
+        }
         _current = merged.ToObject<TrafficVistaOptions>() ?? new();
         _current.Validate();
     }
@@ -95,17 +113,19 @@ public sealed class TrafficVistaSettings : IOptions<TrafficVistaOptions>
         return value as JObject ?? throw new InvalidDataException($"配置的 {name} 节必须是 JSON 对象。");
     }
 
-    public SchedulerOptions CreateSchedulerOptions(TrafficVistaOptions uiOptions)
+    public SchedulerOptions CreateSchedulerOptions(TrafficVistaOptions uiOptions, string? restartResumeToken = null)
     {
         uiOptions.Validate();
         return SchedulingDefaults with
         {
-            WorkerCount = uiOptions.TaskWorkerCount,
+            WorkerCount = uiOptions.MaxConcurrency,
             QueueCapacity = checked(uiOptions.MaxConcurrency * uiOptions.Multiple * 2),
             PollInterval = TimeSpan.FromMilliseconds(uiOptions.TaskFetchInterval),
             EmptyPollInterval = TimeSpan.FromMilliseconds(uiOptions.TaskFetchInterval),
             CompleteWhenSourceEmpty = false,
-            LocalCache = Business.TaskRecoveryMode == TaskRecoveryMode.Save ? new Scheduling.Persistence.LocalTaskCacheOptions
+            LocalCache = uiOptions.AutoRestartMinutes > 0 || restartResumeToken is not null
+                ? Scheduling.Persistence.RestartQueueFiles.Create(Path.Combine(Path.GetDirectoryName(UserFilePath)!, "business", "restart"), restartResumeToken)
+                : Business.TaskRecoveryMode == TaskRecoveryMode.Save ? new Scheduling.Persistence.LocalTaskCacheOptions
             {
                 FilePath = Path.Combine(Path.GetDirectoryName(UserFilePath)!, "business", "pending",
                     Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
@@ -135,7 +155,7 @@ public sealed class TrafficVistaSettings : IOptions<TrafficVistaOptions>
             var section = GetSection(root, sectionKey) ?? new JObject();
             // 清理旧演示界面字段；其余未知配置继续保留。
             foreach (var property in section.Properties().Where(property =>
-                new[] { "FirstUserId", "TaskCount", "WorkerCount" }.Contains(property.Name, StringComparer.OrdinalIgnoreCase)).ToArray())
+                new[] { "FirstUserId", "TaskCount", "WorkerCount", "TaskWorkerCount", "StrictJavaScriptUrlCache" }.Contains(property.Name, StringComparer.OrdinalIgnoreCase)).ToArray())
                 property.Remove();
             foreach (var property in JObject.FromObject(options).Properties())
             {

@@ -29,12 +29,17 @@ public sealed class NetOptions
     /// </summary>
     public int AcquireRetryCount { get; set; } = 5;
 
+    /// <summary>代理获取失败后、下一次重试前等待的毫秒数；0 表示立即重试。</summary>
+    public int AcquireRetryIntervalMilliseconds { get; set; } = 1000;
+
     public void Validate()
     {
         if (ConnectTimeoutSeconds is < 1 or > 120)
             throw new InvalidDataException($"Net:ConnectTimeoutSeconds 必须在 1～120 秒之间（当前 {ConnectTimeoutSeconds}）。");
         if (AcquireRetryCount is < 0 or > 10)
             throw new InvalidDataException($"Net:AcquireRetryCount 必须在 0～10 之间（当前 {AcquireRetryCount}）。");
+        if (AcquireRetryIntervalMilliseconds is < 0 or > 600_000)
+            throw new InvalidDataException($"Net:AcquireRetryIntervalMilliseconds 必须在 0～600000 毫秒之间（当前 {AcquireRetryIntervalMilliseconds}）。");
         if (MaxResponseBytes is < 1_024 or > 16_777_216)
             throw new InvalidDataException($"Net:MaxResponseBytes 必须在 1024～16777216 字节之间（当前 {MaxResponseBytes}）。");
         if (IpInfoMaxConcurrency is < 1 or > 64)

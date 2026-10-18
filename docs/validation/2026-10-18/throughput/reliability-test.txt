@@ -1,0 +1,21 @@
+PASS IpInfo 无效快响应淘汰、慢正文超时/取消、代理认证/协议/领取时刻 TTL、设备源切换
+PASS 全局浏览器启动并发与启动间隔；UV按任务间隔独立投递
+PASS 1000 倍惰性批次、同 ID 独立领取、待执行任务恢复且不重放已领取任务
+PASS 队列满时取消保存批次尾部、重启恢复未执行任务、空收件箱压缩及压缩失败后原日志可继续领取
+PASS URL跨身份共享、查询参数区分、并发原子发布、配置TTL及大资源缓存
+PASS 供应商 TTL=到期不派发、部分成功精确摘要、代理失败快照/摘要
+PASS 会话保留期限：活跃租约保护、已完成过期目录清理
+PASS action/name 唯一参数及原有其他参数保留
+PASS 并发独立启停：3个UV使用不同Chrome PID和隔离存储；页面脚本首读UA/CPU核心数/内存符合各UV设置；进程及辅助阶段清零。
+PASS 真实 Chrome：PV=3 为首次访问及两次刷新，公共CSS共享缓存命中
+PASS 原生缓存：同UV三次PV共享Cookie/存储、资源只下载一次；下一UV独立会话并重新下载
+PASS AndroidViewportMatcher：实际Chrome screen/响应式viewport/DPR与匹配记录一致
+PASS 真实Chrome：480x800、1536x2048、方屏及设备指定DPR=3，screen/viewport/DPR一致
+PASS 导航中取消：247ms，浏览器/UV 归零，临时 profile 已清理
+PASS 共享缓存关闭后仍正常刷新，使用原生浏览器缓存策略
+PASS 首次访问完成重定向，后续PV刷新当前落地页面并保留会话
+PASS 首次导航：超时已有内容继续并提示；限时内非2xx有内容/慢图片静默继续；空白超时、空页面、代理认证/错误页、网关错误及连接拒绝仍失败，浏览器清理归零
+PASS 动态渲染、body零高度绝对定位内容、跨域iframe实际内容；结束变空/跳转网关错误仍失败，检查无响应独立超时且区分为空
+PASS 真实 Chrome：HTTP 407 代理认证及凭证透传
+PASS 真实 Chrome：供应商剩余 TTL 到期清理，1964ms
+输出目录：F:\codex\TrafficVista\.audit-build\throughput-final\demo-output\reliability\4b0597699d2c4efdb26f022adac4731e

@@ -1,0 +1,15 @@
+{
+  "taskId": 639278929133596517,
+  "deliveryId": "c9d0ef5389ed4692ba23b4bc107430be",
+  "workerId": 1,
+  "plannedUvs": 12,
+  "dispatchedUvs": 12,
+  "succeededUvs": 9,
+  "unsuccessfulUvs": 3,
+  "undispatchedUvs": 0,
+  "success": true,
+  "failure": null,
+  "stopReason": null,
+  "elapsedMs": 56459.8579,
+  "finishedAt": "2026-10-18T04:02:49.941618+00:00"
+}

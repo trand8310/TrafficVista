@@ -23,6 +23,55 @@ internal static class ReliabilityIntegrationTest
     private static readonly byte[] Png = Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==");
     private static readonly string DeviceJson = """{"success":true,"data":[{"ua":"Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/145.0.0.0 Mobile Safari/537.36","sw":1080,"sh":2400,"cpu":8,"make":"Test","model":"Offline"}]}""";
 
+    // Fixed production-shaped workload, independent of the legacy zero-dwell microbenchmark.
+    internal static async Task<string> RunThroughputAsync(ILogger logger)
+    {
+        var root = Path.Combine(AppContext.BaseDirectory, "demo-output", "throughput", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        await using var server = new TestServer();
+        using var playwright = await Playwright.CreateAsync();
+        var business = new BusinessOptions
+        {
+            ExportRunData = true, SessionRoot = Path.Combine(root, "tasks"), StaticCacheRoot = Path.Combine(root, "cache"),
+            ChromeExecutablePath = Environment.GetEnvironmentVariable("TRAFFICVISTA_TEST_CHROME")
+                ?? Path.Combine(AppContext.BaseDirectory, "File/chrome-win/145.0.7632.110/chrome.exe")
+        };
+        using var cache = new SharedStaticResourceCache(business, logger);
+        var rows = new JArray();
+        var report = new StringBuilder("本地页面，每任务12 UV、2秒投递、DOM后等待10秒、导航超时20秒；每任务160秒期限。\n");
+        foreach (var workers in new[] { 1, 2 })
+        {
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(160));
+            using var launches = new BrowserLaunchLimiter(4, 0, () => SystemPressureProbe.Shared.Latest);
+            var metrics = new BusinessMetrics();
+            metrics.Reset();
+            var runner = new BusinessUvBrowserRunner(playwright, launches, cache, logger, metrics, business);
+            using var consumer = new BrowserTaskConsumer(new FakeDevices(), new NoProxy(), runner, business, logger, metrics);
+            consumer.Configure(new() { MaxConcurrency = workers, IsHiddenMode = true, PageLoadingTimeout = 20,
+                PageLoadingDelay = 10, UvExecutionInterval = 2000, IsCacheMode = false });
+            var watch = Stopwatch.StartNew();
+            var outcomes = await Task.WhenAll(Enumerable.Range(1, workers).Select(worker =>
+                consumer.ConsumeAsync(TaskFor(server.Url + "page", 12, 1) with { WorkerId = worker }, deadline.Token).AsTask()));
+            watch.Stop();
+            metrics.StopRuntime();
+            var snapshot = metrics.Snapshot;
+            Expect(snapshot.ActiveBrowsers == 0 && ChromeProcessJob.OwnedProcessCount == 0, "throughput Chrome cleanup");
+            Expect(await BrowserCloseCoordinator.Shared.DrainAsync(TimeSpan.FromSeconds(15)), "throughput driver-close drain");
+            var row = JObject.FromObject(snapshot);
+            row["workers"] = workers;
+            row["elapsedSeconds"] = watch.Elapsed.TotalSeconds;
+            row["successfulUvsPerMinute"] = snapshot.SucceededUvs * 60 / watch.Elapsed.TotalSeconds;
+            row["allUvsSucceeded"] = outcomes.All(value => value) && snapshot.SucceededUvs == workers * 12
+                && snapshot.FailedUvs == 0 && snapshot.CanceledUvs == 0;
+            rows.Add(row);
+            await File.WriteAllTextAsync(Path.Combine(root, "throughput.json"), rows.ToString());
+            report.AppendLine($"任务并发{workers}: {snapshot.SucceededUvs}/{workers * 12} UV成功，失败{snapshot.FailedUvs}，{watch.Elapsed.TotalSeconds:F2}s，{snapshot.SucceededUvs * 60 / watch.Elapsed.TotalSeconds:F1} UV/min，P95={snapshot.UvP95Ms:F0}ms，峰值浏览器={snapshot.PeakBrowsers}，所属进程已清零。");
+            logger.Information("吞吐基准完成，Workers={Workers}，ElapsedSeconds={ElapsedSeconds}，Output={Output}", workers, watch.Elapsed.TotalSeconds, root);
+        }
+        report.AppendLine("仅表示本机本地页面结果，不代表真实代理、网络及目标网站容量。输出目录：" + root);
+        return report.ToString();
+    }
+
     internal static async Task<string> RunBrowserCloseAsync(ILogger logger)
     {
         var root = Path.Combine(AppContext.BaseDirectory, "demo-output", "browser-close", Guid.NewGuid().ToString("N"));
@@ -43,7 +92,7 @@ internal static class ReliabilityIntegrationTest
             var directory = Path.Combine(root, scenario);
             Directory.CreateDirectory(directory);
             using var requested = new CancellationTokenSource(TimeSpan.FromSeconds(45));
-            var options = new TrafficVistaOptions { IsHiddenMode = true, PageLoadingTimeout = 20,
+            var options = new TrafficVistaOptions { IsHiddenMode = true, IsCacheMode = true, PageLoadingTimeout = 20,
                 PageLoadingDelay = scenario == "pageDelay" ? 60m : 0m };
             var run = new BusinessUvRun(1, 1, new(server.Url + "page"), directory, TestDevice(), null, options,
                 scenario is "pageDelay" or "normal" ? TimeSpan.Zero : TimeSpan.FromSeconds(60), 1, null);
@@ -82,13 +131,21 @@ internal static class ReliabilityIntegrationTest
         {
             consumer.Configure(new() { MaxConcurrency = 1, IsHiddenMode = true, PageLoadingDelay = 0, UvExecutionInterval = 0 });
             var task = TaskFor(server.Url + "page", 1, 2);
+            var before = metrics.Snapshot;
             Expect(await consumer.ConsumeAsync(task, CancellationToken.None), "no-export real browser with repeated PV");
+            var after = metrics.Snapshot;
+            Expect(after.DispatchedUvs - before.DispatchedUvs == 1
+                && after.BrowserStartAttempts - before.BrowserStartAttempts == 1
+                && after.ExposedUvs - before.ExposedUvs == 1, "one UV with two PV counts one submission, start and exposure");
+            report.AppendLine("PASS 真实Chrome运行指标：一个UV、两个PV，提交/执行/曝光各增加1。");
             Expect(!Directory.Exists(noExport.SessionRoot), "disabled export must not create business archives");
             var tempTask = Path.Combine(Path.GetTempPath(), "TrafficVista", "uv", task.Id.ToString());
             Expect(!Directory.Exists(tempTask) || !Directory.EnumerateFileSystemEntries(tempTask).Any(), "temporary run must be removed");
             Expect(metrics.Snapshot.ActiveBrowsers == 0 && ChromeProcessJob.OwnedProcessCount == 0, "no-export browser cleanup");
         }
-        report.AppendLine("PASS 关闭导出时真实Chrome完成两个PV，不创建业务归档，临时运行目录及进程清理完成。");
+        Expect(await BrowserCloseCoordinator.Shared.DrainAsync(TimeSpan.FromSeconds(15)), "all driver close requests drain before releasing Playwright");
+        Expect(BrowserCloseCoordinator.Shared.Snapshot.InFlight == 0, "driver close requests return to zero");
+        report.AppendLine("PASS 关闭导出时真实Chrome完成两个PV，不创建业务归档，临时运行目录及进程清理完成；Playwright关闭请求排空。");
         report.AppendLine("PASS 正常关闭不误报；手动页面关闭/浏览器退出计为当前UV失败，外部取消保持取消分类；进程/浏览器计数归零。仅使用本地页面及本测试创建的Chrome。");
         return report.ToString();
     }
@@ -111,7 +168,7 @@ internal static class ReliabilityIntegrationTest
         if (!benchmark)
         {
             await VerifyNetAsync(server, logger, report);
-            await VerifyAdmissionAsync(report);
+            await VerifyLaunchLimitAsync(report);
             await VerifyPersistenceAsync(directory, report);
             await VerifyCacheAsync(business, logger, report);
             await VerifyConsumerAsync(business, logger, report);
@@ -124,7 +181,7 @@ internal static class ReliabilityIntegrationTest
 
         using var playwright = await Playwright.CreateAsync();
         if (!File.Exists(business.ChromeExecutablePath)) throw new FileNotFoundException("离线浏览器验证需要本地 Chrome；设置 TRAFFICVISTA_TEST_CHROME。", business.ChromeExecutablePath);
-        using var launches = new BrowserLaunchLimiter(4);
+        using var launches = new BrowserLaunchLimiter(4, 0, () => SystemPressureProbe.Shared.Latest);
         using var cache = new SharedStaticResourceCache(business, logger);
         var metrics = new BusinessMetrics();
         var runner = new BusinessUvBrowserRunner(playwright, launches, cache, logger, metrics, business);
@@ -160,7 +217,14 @@ internal static class ReliabilityIntegrationTest
                     catch (OperationCanceledException) { }
                 });
                 var success = false;
-                try { success = await consumer.ConsumeAsync(TaskFor(server.Url + "page", 8, 1), CancellationToken.None); }
+                try
+                {
+                    var outcomes = new ConcurrentBag<bool>();
+                    await Parallel.ForEachAsync(Enumerable.Range(1, 8), new ParallelOptions { MaxDegreeOfParallelism = concurrency },
+                        async (index, token) => outcomes.Add(await consumer.ConsumeAsync(
+                            TaskFor(server.Url + "page", 1, 1) with { WorkerId = index }, token)));
+                    success = outcomes.All(value => value) && measured.Snapshot.SucceededUvs == 8;
+                }
                 finally { sampling.Cancel(); await sample; }
                 Expect(success && measured.Snapshot.ActiveBrowsers == 0, "benchmark cleanup");
                 var row = JObject.FromObject(measured.Snapshot);
@@ -176,6 +240,7 @@ internal static class ReliabilityIntegrationTest
         }
         else
         {
+            await VerifyIndependentStartupAsync(server, business, runner, metrics, logger, report);
             using var consumer = new BrowserTaskConsumer(devices, new NoProxy(), runner, business, logger, metrics);
             // 首次导航按DOM就绪继续；缓存用例保留短停留，确保图片请求有机会完成。
             consumer.Configure(options with { PageLoadingDelay = 0.2m });
@@ -340,6 +405,36 @@ internal static class ReliabilityIntegrationTest
         return report.ToString();
     }
 
+    private static async Task VerifyIndependentStartupAsync(TestServer server, BusinessOptions business,
+        BusinessUvBrowserRunner runner, BusinessMetrics metrics, ILogger logger, StringBuilder report)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        var results = await Task.WhenAll(Enumerable.Range(1, 3).Select(async index =>
+        {
+            var profile = TestDevice() with { DeviceKey = Guid.NewGuid().ToString("N"), CpuCores = index * 2,
+                UserAgent = TestDevice().UserAgent + " TrafficVista/" + index };
+            using var consumer = new BrowserTaskConsumer(new FakeDevices(profile), new NoProxy(), runner, business, logger, metrics);
+            consumer.Configure(new() { MaxConcurrency = 3, IsHiddenMode = true, PageLoadingTimeout = 20 });
+            var task = TaskFor(server.Url + "native-session", 1, 1) with { WorkerId = index };
+            task.Payload!["sleep"] = "0.3-0.3";
+            Expect(await consumer.ConsumeAsync(task, timeout.Token), "independent concurrent Chrome must succeed");
+            var state = ReadNativeState(business.SessionRoot, task.Id);
+            var fingerprint = JObject.Parse(state["fingerprint"]);
+            Expect(fingerprint.Value<string>("ua") == profile.UserAgent && fingerprint.Value<int>("cores") == profile.CpuCores
+                && fingerprint.Value<int>("memory") == 8, "UA, CPU cores and device memory are applied before page scripts execute");
+            var result = JObject.Parse(File.ReadAllText(Directory.EnumerateFiles(Path.Combine(business.SessionRoot, task.Id.ToString()),
+                "result.json", SearchOption.AllDirectories).Single()));
+            return (Session: state["session"], Pid: result.Value<int>("browserProcessId"));
+        }));
+        Expect(results.Select(result => result.Session).Distinct().Count() == 3
+            && results.All(result => result.Pid > 0) && results.Select(result => result.Pid).Distinct().Count() == 3,
+            "every UV owns a distinct Chrome process and isolated storage");
+        Expect(metrics.Snapshot.ActiveBrowsers == 0 && ChromeProcessJob.OwnedProcessCount == 0
+            && metrics.Snapshot.ActiveStages.Count == 0, "parallel startup diagnostics and native processes finish before UV releases");
+        server.NativeCookies.Clear();
+        report.AppendLine("PASS 并发独立启停：3个UV使用不同Chrome PID和隔离存储；页面脚本首读UA/CPU核心数/内存符合各UV设置；进程及辅助阶段清零。");
+    }
+
     private static async Task VerifyNetAsync(TestServer server, ILogger logger, StringBuilder report)
     {
         var net = new NetOptions { IpInfo = new IpInfoOptions { ApiUrls = [server.Url + "bad-ip", server.Url + "good-ip"], RequestTimeoutSeconds = 2 } };
@@ -376,26 +471,13 @@ internal static class ReliabilityIntegrationTest
         report.AppendLine("PASS IpInfo 无效快响应淘汰、慢正文超时/取消、代理认证/协议/领取时刻 TTL、设备源切换");
     }
 
-    private static async Task VerifyAdmissionAsync(StringBuilder report)
+    private static async Task VerifyLaunchLimitAsync(StringBuilder report)
     {
-        using var gate = new FairUvAdmission(1);
-        await gate.AcquireAsync(CancellationToken.None);
-        var order = new List<int>();
-        async Task Waiter(int number, CancellationToken token)
-        { await gate.AcquireAsync(token); order.Add(number); gate.Release(); }
-        using var canceled = new CancellationTokenSource();
-        var first = Waiter(1, canceled.Token);
-        var second = Waiter(2, CancellationToken.None);
-        var third = Waiter(3, CancellationToken.None);
-        canceled.Cancel(); gate.Release();
-        try { await first; throw new InvalidOperationException("Canceled permit was granted"); } catch (OperationCanceledException) { }
-        await Task.WhenAll(second, third);
-        Expect(order.SequenceEqual(new[] { 2, 3 }), "FIFO after canceled waiter");
-        await gate.StartAsync(100, CancellationToken.None);
-        var elapsed = Stopwatch.StartNew();
-        await Task.WhenAll(gate.StartAsync(100, CancellationToken.None), gate.StartAsync(100, CancellationToken.None));
-        Expect(elapsed.Elapsed >= TimeSpan.FromMilliseconds(180), "global interval");
-        report.AppendLine("PASS FIFO 准入、取消不占许可、跨任务全局启动间隔");
+        using var launches = new BrowserLaunchLimiter(2, 30);
+        await Task.WhenAll(Enumerable.Range(0, 6).Select(_ => launches.ExecuteAsync(
+            () => Task.Delay(80), CancellationToken.None)));
+        Expect(launches.PeakConcurrentStarts == 2, "global browser startup limit");
+        report.AppendLine("PASS 全局浏览器启动并发与启动间隔；UV按任务间隔独立投递");
     }
 
     private static async Task VerifyPersistenceAsync(string directory, StringBuilder report)
@@ -487,9 +569,10 @@ internal static class ReliabilityIntegrationTest
         Expect(!await consumer.ConsumeAsync(expired, CancellationToken.None) && runner.Calls == 0, "vendor deadline honored with IpTtl=0");
         consumer.Configure(new() { MaxConcurrency = 1, UvExecutionInterval = 0 });
         var partial = TaskFor("http://test.invalid/", 3, 1);
-        Expect(!await consumer.ConsumeAsync(partial, CancellationToken.None), "partial success returns task failure");
+        Expect(await consumer.ConsumeAsync(partial, CancellationToken.None), "at least one successful UV makes task successful");
         var summary = FindSummary(business.SessionRoot, partial.Id);
-        Expect(summary.Value<int>("succeededUvs") == 2 && summary.Value<int>("unsuccessfulUvs") == 1, "partial summary counts");
+        Expect(summary.Value<bool>("success") && summary.Value<int>("succeededUvs") == 2
+            && summary.Value<int>("unsuccessfulUvs") == 1, "partial summary counts and current task-success contract");
         var throwing = new ThrowingProxy();
         using var failed = new BrowserTaskConsumer(new FakeDevices(), throwing, runner, business, logger);
         failed.Configure(new() { MaxConcurrency = 1 });
@@ -524,7 +607,8 @@ internal static class ReliabilityIntegrationTest
         return state["origins"]!.SelectMany(origin => origin["localStorage"]!)
             .ToDictionary(item => item.Value<string>("name")!, item => item.Value<string>("value")!);
     }
-    private static TaskEnvelope TaskFor(string url, int uv, int pv) => new(DateTime.UtcNow.Ticks, "离线验证", url, DateTime.UtcNow)
+    private static long _taskIds = DateTime.UtcNow.Ticks;
+    private static TaskEnvelope TaskFor(string url, int uv, int pv) => new(Interlocked.Increment(ref _taskIds), "离线验证", url, DateTime.UtcNow)
         { Payload = new JObject { ["uv"] = uv, ["pv"] = pv, ["sleep"] = "0-0" } };
     private static BusinessDeviceProfile TestDevice() => new("offline", "Test", "Offline", "", "14", 1080, 2400,
         "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/145.0.0.0 Mobile Safari/537.36", 8, "", "", null);
@@ -660,6 +744,8 @@ internal static class ReliabilityIntegrationTest
                             <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body>native session<script>
                             localStorage.setItem('browserViewport', JSON.stringify({innerWidth, innerHeight,
                               screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio}));
+                            localStorage.setItem('fingerprint', JSON.stringify({ua: navigator.userAgent,
+                              cores: navigator.hardwareConcurrency, memory: navigator.deviceMemory}));
                             localStorage.setItem('pvs', String(Number(localStorage.getItem('pvs') || 0) + 1));
                             let session = localStorage.getItem('session');
                             if (!session) { session = crypto.randomUUID(); localStorage.setItem('session', session); }

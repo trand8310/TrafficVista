@@ -15,6 +15,19 @@ internal static class ProxyRequestIntegrationTest
 {
     public static async Task<string> RunAsync(ILogger logger)
     {
+        var probe = new AcquisitionProbe();
+        var serialOptions = new NetOptions { DefaultVendor = "a", Vendors = new()
+        {
+            ["a"] = new() { ApiUrl = "https://offline.invalid/a", MaxConcurrency = 4 },
+            ["b"] = new() { ApiUrl = "https://offline.invalid/b", MaxConcurrency = 4 }
+        } };
+        using (var serial = new ProxyService(serialOptions,
+            new([new SerialAdapter("a", probe), new SerialAdapter("b", probe)], serialOptions), new Info(), logger))
+        {
+            await Task.WhenAll(Enumerable.Range(0, 12).Select(i => serial.AcquireAsync(
+                new ProxyAcquireRequest { Settings = new() { ResolveRealIp = false, FetchIpDetails = false } }, i % 2 == 0 ? "a" : "b")));
+            Check(probe.Peak == 1 && probe.Calls == 12, "跨供应商、跨任务全局串行取IP");
+        }
         var task = new TaskEnvelope(23, "region-test", "http://offline.invalid/", DateTime.UtcNow)
         { Payload = new JObject { ["regions"] = "北京[0],上海[2],湖南[23]:长沙[267]", ["other"] = new JArray(1, 2) } };
         foreach (var real in new[] { false, true })
@@ -35,10 +48,22 @@ internal static class ProxyRequestIntegrationTest
             Check(task.Payload!["regions"]!.Value<string>()!.StartsWith("北京"), "请求快照隔离");
         }
         var retryAdapter = new Adapter(); var retryInfo = new Info { Failures = 1 };
+        Check(new NetOptions().AcquireRetryIntervalMilliseconds == 1000, "默认重试间隔1000毫秒");
         using (var service = Service(retryAdapter, retryInfo, logger))
         {
             var result = await service.AcquireAsync(new ProxyAcquireRequest { Task = task, Settings = new() { FetchIpDetails = true } });
             Check(retryAdapter.Calls == 2 && retryInfo.Ports.Distinct().Count() == 2 && result.Proxy.Port == 8002, "查询失败重新领取新代理");
+            Check(System.Diagnostics.Stopwatch.GetElapsedTime(retryAdapter.Attempts[0], retryAdapter.Attempts[1])
+                >= TimeSpan.FromMilliseconds(1000), "失败后等待配置间隔再重试");
+        }
+        using (var stop = new CancellationTokenSource())
+        {
+            var adapter = new Adapter();
+            using var service = Service(adapter, new Info { Failures = 99, OnFailure = () => stop.CancelAfter(50) }, logger, 5000);
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            try { await service.AcquireAsync(cancellationToken: stop.Token); throw new InvalidOperationException("重试等待未响应取消"); }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested)
+            { Check(adapter.Calls == 1 && elapsed.Elapsed < TimeSpan.FromSeconds(2), "取消中断重试等待且不再请求"); }
         }
         var failedAdapter = new Adapter();
         using (var service = Service(failedAdapter, new Info { Failures = 99 }, logger))
@@ -163,27 +188,51 @@ internal static class ProxyRequestIntegrationTest
         return "PASS\n代理及直连四种开关组合、真实IP回退、请求快照、直连单次查询/失败/取消且不领代理不应用代理TTL、完整详情及Chrome环境参数、真实直连Chrome时区与地理位置验证通过。全部使用离线测试数据。";
     }
 
-    private static ProxyService Service(Adapter adapter, Info info, ILogger logger)
+    private static ProxyService Service(Adapter adapter, Info info, ILogger logger, int retryInterval = 1000)
     {
         var options = new NetOptions { DefaultVendor = "fake", AcquireRetryCount = 1,
+            AcquireRetryIntervalMilliseconds = retryInterval,
             Vendors = new() { ["fake"] = new() { Enabled = true, ApiUrl = "https://offline.invalid/get" } } };
         return new(options, new([adapter], options), info, logger);
     }
     private static void Check(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+    private sealed class AcquisitionProbe { public int Active, Peak, Calls; }
+    private sealed class SerialAdapter(string id, AcquisitionProbe probe) : IProxyVendorAdapter
+    {
+        public string VendorId => id;
+        public Task<ProxyEndpoint> AcquireProxyAsync(string url, CancellationToken token) => AcquireProxyAsync(url, new(), token);
+        public async Task<ProxyEndpoint> AcquireProxyAsync(string url, ProxyAcquireRequest request, CancellationToken token)
+        {
+            var active = Interlocked.Increment(ref probe.Active);
+            Interlocked.Increment(ref probe.Calls);
+            int previous;
+            do { previous = probe.Peak; if (previous >= active) break; }
+            while (Interlocked.CompareExchange(ref probe.Peak, active, previous) != previous);
+            try
+            {
+                await Task.Delay(20, token);
+                return new() { VendorId = id, Host = "127.0.0.1", Port = 8000, RealIp = "203.0.113.8" };
+            }
+            finally { Interlocked.Decrement(ref probe.Active); }
+        }
+    }
     private sealed class Adapter : IProxyVendorAdapter
     {
         public string VendorId => "fake";
         public string? SupplierIp; public int Calls; public ProxyAcquireRequest? Last;
+        public List<long> Attempts = [];
         public Task<ProxyEndpoint> AcquireProxyAsync(string url, CancellationToken token) => AcquireProxyAsync(url, new(), token);
         public Task<ProxyEndpoint> AcquireProxyAsync(string url, ProxyAcquireRequest request, CancellationToken token)
         {
             token.ThrowIfCancellationRequested(); Last = request; Calls++;
+            Attempts.Add(System.Diagnostics.Stopwatch.GetTimestamp());
             return Task.FromResult(new ProxyEndpoint { VendorId = VendorId, Host = "127.0.0.1", Port = 8000 + Calls, RealIp = SupplierIp });
         }
     }
     private sealed class Info : IProxyIpInfoProvider
     {
         public int Calls; public int Failures; public CancellationTokenSource? Cancel; public List<int> Ports = [];
+        public Action? OnFailure;
         public int DirectCalls;
         public Task<JObject> QueryDirectAsync(CancellationToken token)
         {
@@ -194,7 +243,7 @@ internal static class ProxyRequestIntegrationTest
         public Task<JObject> QueryAsync(ProxyEndpoint proxy, CancellationToken token)
         {
             Calls++; Ports.Add(proxy.Port); Cancel?.Cancel(); token.ThrowIfCancellationRequested();
-            if (Calls <= Failures) throw new IOException("offline ipinfo fixture failed");
+            if (Calls <= Failures) { OnFailure?.Invoke(); throw new IOException("offline ipinfo fixture failed"); }
             return Task.FromResult(new JObject { ["ip"] = "198.51.100.9", ["unknown"] = new JObject { ["keep"] = true } });
         }
     }

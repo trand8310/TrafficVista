@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Serilog;
 using Serilog.Events;
+using TrafficVista.Scheduling;
 
 namespace TrafficVista.UiLogging;
 
@@ -14,7 +15,13 @@ internal static class LiveLogIntegrationTest
         Check(skipped == 6 && batch.Length == 2 && batch[0].Sequence == 7 && batch[1].Sequence == 8, "环形覆盖及分批游标");
         var buffer = new LiveLogBuffer();
         using var sink = new LiveLogSink(buffer);
-        using var logger = new LoggerConfiguration().MinimumLevel.Verbose().WriteTo.Sink(sink).CreateLogger();
+        using var logger = new LoggerConfiguration().MinimumLevel.Verbose().Enrich.With(new WorkerIdEnricher()).WriteTo.Sink(sink).CreateLogger();
+        using (WorkerExecutionContext.Enter(7)) logger.Information("worker-seven-marker");
+        logger.Information("non-worker-marker");
+        WaitUntil(() => buffer.ReadAfter(0, buffer.Capacity, out _).Any(entry => entry.Text == "non-worker-marker"));
+        var identities = buffer.ReadAfter(0, buffer.Capacity, out _);
+        Check(identities.Single(entry => entry.Text == "worker-seven-marker").WorkerId == 7
+            && identities.Single(entry => entry.Text == "non-worker-marker").WorkerId == 0, "异步日志队列保留发送时工作者编号，非工作者为0");
         using var form = new Form { Size = new(1000, 600), ShowInTaskbar = false, Opacity = 0 };
         using var view = new LiveLogView(buffer) { Dock = DockStyle.Fill };
         form.Controls.Add(view);
@@ -27,6 +34,7 @@ internal static class LiveLogIntegrationTest
         var emitWatch = Stopwatch.StartNew();
         var producers = Task.WhenAll(Enumerable.Range(0, 4).Select(worker => Task.Run(() =>
         {
+            using var scope = WorkerExecutionContext.Enter(worker + 1);
             for (var i = 0; i < 10000; i++) logger.Information("压力日志 Worker={Worker}, Index={Index}", worker, i);
         })));
         var deadline = Stopwatch.StartNew();
@@ -43,6 +51,7 @@ internal static class LiveLogIntegrationTest
         var sustainedTicksBefore = timerTicks;
         var sustained = Task.WhenAll(Enumerable.Range(0, 4).Select(worker => Task.Run(async () =>
         {
+            using var scope = WorkerExecutionContext.Enter(worker + 1);
             for (var batchIndex = 0; batchIndex < 200; batchIndex++)
             {
                 for (var i = 0; i < 10; i++) logger.Information("持续日志 Worker={Worker}, Batch={Batch}, Index={Index}", worker, batchIndex, i);
@@ -74,8 +83,13 @@ internal static class LiveLogIntegrationTest
         for (var i = 0; i < 20; i++) view.FlushPending();
         Check(view.RowCount == 2000, "虚拟行淘汰失效");
         view.ClearDisplay(); Check(view.RowCount == 0, "清空显示失效");
-        buffer.Append("12:00:00", LogEventLevel.Information, "清空后新日志"); view.FlushPending();
+        buffer.Append("12:00:00", LogEventLevel.Information, "清空后新日志", 3); view.FlushPending();
         Check(view.RowCount == 1, "清空后未继续显示新日志");
+        var list = (ListView)view.Controls.Find("listView_Logs", true).Single();
+        Check(list.Columns.Count == 4 && list.Columns[2].Text == "工作者" && list.Items[0].SubItems[2].Text == "3"
+            && list.Items[0].SubItems[3].Text == "清空后新日志", "工作者独立列与消息列对齐");
+        buffer.Append("12:00:00", LogEventLevel.Information, "非工作者日志"); view.FlushPending();
+        Check(list.Items[1].SubItems[2].Text == "0", "非工作者日志显示0");
         // Keep the message loop alive after producers finish as well, so background formatting cannot hide a UI deadlock.
         while (deadline.Elapsed < TimeSpan.FromMilliseconds(350)) { Application.DoEvents(); Thread.Sleep(2); }
         Check(timerTicks > 0, "日志压力期间UI心跳未处理");

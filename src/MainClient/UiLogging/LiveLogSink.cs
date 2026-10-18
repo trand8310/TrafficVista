@@ -44,7 +44,9 @@ internal sealed class LiveLogSink : ILogEventSink, IDisposable
                     using var text = new LimitedWriter(MaxTextLength);
                     try { formatter.Format(entry, text); }
                     catch (TextLimitReached) { }
-                    _buffer.Append(entry.Timestamp.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture), entry.Level, text.ToString().TrimEnd());
+                    var workerId = entry.Properties.TryGetValue("WorkerId", out var property)
+                        && property is ScalarValue { Value: int value } && value > 0 ? value : 0;
+                    _buffer.Append(entry.Timestamp.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture), entry.Level, text.ToString().TrimEnd(), workerId);
                 }
                 catch (Exception) { _buffer.MarkDropped(); } // Sink errors cannot recurse into logging or stop the application.
             }

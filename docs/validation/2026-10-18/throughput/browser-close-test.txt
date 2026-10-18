@@ -1,0 +1,8 @@
+PASS
+PASS pageDelay 关闭/取消后完成清理：100ms（原等待60秒）
+PASS dwell 关闭/取消后完成清理：71ms（原等待60秒）
+PASS browser 关闭/取消后完成清理：459ms（原等待60秒）
+PASS cancel 关闭/取消后完成清理：66ms（原等待60秒）
+PASS 真实Chrome运行指标：一个UV、两个PV，提交/执行/曝光各增加1。
+PASS 关闭导出时真实Chrome完成两个PV，不创建业务归档，临时运行目录及进程清理完成；Playwright关闭请求排空。
+PASS 正常关闭不误报；手动页面关闭/浏览器退出计为当前UV失败，外部取消保持取消分类；进程/浏览器计数归零。仅使用本地页面及本测试创建的Chrome。

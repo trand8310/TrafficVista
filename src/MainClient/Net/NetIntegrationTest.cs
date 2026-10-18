@@ -192,7 +192,7 @@ internal static class NetIntegrationTest
             report.AppendLine("场景十一 有效期：领取后计时、查询耗时计入、到期整体失败 ✔");
         }
 
-        // 场景十二：并发隔离——ipzan 上限 2（模拟接口观测 ≤2），IpInfo 总上限 1（假代理观测 ==1），4 路并发全部成功。
+        // 场景十二：即便供应商配置允许2路，全局领取仍串行；详情查询使用独立名额。
         {
             textPrimary.ResetCounters();
             proxy.ResetCounters();
@@ -202,11 +202,11 @@ internal static class NetIntegrationTest
             var results = await Task.WhenAll(Enumerable.Range(0, 4)
                 .Select(_ => service.AcquireAsync(cancellationToken: CancellationToken.None)));
             Expect(results.All(r => r.IpInfo["query"]?.Value<string>() == "203.0.113.7"), "场景十二：4 路并发应全部成功。");
-            Expect(Volatile.Read(ref textPrimary.MaxConcurrent) == 2,
-                $"场景十二：供应商并发应为 2，实际 {textPrimary.MaxConcurrent}。");
+            Expect(Volatile.Read(ref textPrimary.MaxConcurrent) == 1,
+                $"场景十二：全局领取并发应为 1，实际 {textPrimary.MaxConcurrent}。");
             Expect(Volatile.Read(ref proxy.MaxConcurrent) == 1,
                 $"场景十二：IpInfo 总体并发应为 1，实际 {proxy.MaxConcurrent}。");
-            report.AppendLine("场景十二 并发隔离：供应商上限 2 / IpInfo 总上限 1，互不串扰 ✔");
+            report.AppendLine("场景十二 全局串行取IP：领取峰值1 / IpInfo总上限1，4路任务全部成功 ✔");
         }
 
         // 场景十三：同一家供应商只换 URL 不改路由——ipzan 指向第二台文本接口即换源。
@@ -315,6 +315,7 @@ internal static class NetIntegrationTest
                 $"场景十八b：应共尝试 1+2=3 次，实际 {noipHits} 次。");
 
             var hitsBefore = text500.Hits;
+            var retryStarted = System.Diagnostics.Stopwatch.StartNew();
             using var acqProvider = Build(
                 Options("ipzan", text500.Url, jsonOk, ipInfoOk, acquireRetryCount: 2), logger);
             var acqService = acqProvider.GetRequiredService<IProxyService>();
@@ -322,6 +323,7 @@ internal static class NetIntegrationTest
                 () => acqService.AcquireAsync(cancellationToken: CancellationToken.None), "场景十八c");
             Expect(acqEx.Phase == "acquire", $"场景十八c：应报 acquire 阶段，实际 {acqEx.Phase}。");
             Expect(text500.Hits - hitsBefore == 3, $"场景十八c：领取应共尝试 3 次，实际 {text500.Hits - hitsBefore} 次。");
+            Expect(retryStarted.Elapsed >= TimeSpan.FromSeconds(2), "场景十八c：HTTP领取失败的两次重试各等待默认1000毫秒。");
             report.AppendLine("场景十八 瑕疵代理重试：拿不到真实 IP 即丢弃换新代理，次数受 AcquireRetryCount 控制 ✔");
         }
 

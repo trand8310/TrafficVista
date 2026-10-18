@@ -10,6 +10,8 @@ public sealed record LocalTaskCacheOptions
     public TimeSpan CheckpointInterval { get; init; } = TimeSpan.FromSeconds(1);
     /// <summary>Only use with globally unique delivery IDs. Compacts claims after an empty snapshot is durable.</summary>
     public bool CompactClaimsWhenEmpty { get; init; }
+    internal bool RestartOnly { get; init; }
+    internal bool DeleteWhenEmpty { get; init; }
 
     internal void Validate()
     {

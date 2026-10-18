@@ -1,28 +1,42 @@
 using System.Diagnostics;
+using System.Collections.Concurrent;
+using TrafficVista.Caching;
 using System.Globalization;
 using Newtonsoft.Json.Linq;
 using Microsoft.Playwright;
 using Serilog;
 using TrafficVista.Common;
+using TrafficVista.Scheduling;
+using TrafficVista.Configuration;
 
 namespace TrafficVista.Business;
 
 /// <summary>Independent, owned Chrome process per UV, with bounded cleanup and tracked cache writes.</summary>
-public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunchLimiter launches,
-    SharedStaticResourceCache cache, ILogger logger, BusinessMetrics? metrics = null, BusinessOptions? business = null)
+public sealed class BusinessUvBrowserRunner(IPlaywright? playwright, BrowserLaunchLimiter launches,
+    SharedStaticResourceCache cache, ILogger logger, BusinessMetrics? metrics = null, BusinessOptions? business = null,
+    BusinessPlaywrightDrivers? drivers = null)
     : IBusinessUvRunner
 {
     private readonly BusinessMetrics _metrics = metrics ?? new();
     private readonly BusinessOptions _business = business ?? new();
     internal Action<IBrowser, IPage>? BrowserReadyForTest { get; set; }
+    private sealed class DriverUse : IDisposable
+    {
+        internal BusinessPlaywrightDrivers.Lease? Lease;
+        public void Dispose() => Lease?.Dispose();
+    }
 
     public async Task<bool> RunAsync(BusinessUvRun run, CancellationToken cancellationToken)
     {
+        using var worker = WorkerExecutionContext.Enter(run.WorkerId);
+        using var driverUse = new DriverUse();
+        var driverId = drivers?.DriverIdFor(run.WorkerId) ?? 1;
         using var lifetime = new BrowserLifetimeGuard(cancellationToken);
         var token = lifetime.Token;
         OwnedChromeSession? session = null;
         IBrowserContext? context = null;
         IPage page = null!;
+        var origins = new ConcurrentDictionary<IRequest, CacheAccess>(ReferenceEqualityComparer.Instance);
         int? latestDocumentStatus = null;
         string? latestDocumentFailure = null;
         EventHandler<IResponse> documentResponse = (_, response) =>
@@ -32,6 +46,7 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
         };
         EventHandler<IRequest> documentFailure = (_, request) =>
         {
+            if (origins.TryRemove(request, out var abandoned)) abandoned.Dispose();
             if (request.IsNavigationRequest && request.Frame == page.MainFrame)
                 latestDocumentFailure = request.Failure;
         };
@@ -49,6 +64,15 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
                 "viewport" => "环境设置",
                 "launch" => "浏览器启动排队",
                 "browserStart" => "浏览器启动",
+                "playwrightLaunch" => "Playwright启动",
+                "driverStart" => "Playwright驱动准备",
+                "launchCdpConnect" => "启动CDP连接",
+                "launchProcessQuery" => "启动进程查询",
+                "launchProcessAttach" => "启动进程绑定",
+                "launchMainProcessAttach" => "启动主进程绑定",
+                "launchProcessSnapshot" => "启动子进程扫描",
+                "launchChildProcessAttach" => "启动子进程绑定",
+                "launchCdpDetach" => "启动CDP断开",
                 "context" => "会话创建",
                 "page" => "页面创建",
                 "cdp" => "CDP环境设置",
@@ -64,16 +88,68 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
             };
             activeStage = _metrics.Track(name);
         }
-        var stages = new JObject();
+        // Diagnostic CDP teardown overlaps page setup; timing writers must not mutate a shared JObject.
+        var stages = new ConcurrentDictionary<string, double>();
+        JObject StageSnapshot() => JObject.FromObject(stages.ToArray().ToDictionary(pair => pair.Key, pair => pair.Value));
+        IDisposable TrackLaunchPhase(string phase)
+        {
+            SetStage(phase);
+            return new StartupTiming(activeStage!, elapsed =>
+            {
+                stages[phase + "Ms"] = elapsed.TotalMilliseconds;
+                if (elapsed.TotalSeconds >= 3)
+                    logger.Warning("浏览器启动慢阶段结束（含失败或取消），Phase={Phase}，ElapsedMs={ElapsedMs:F0}，TaskId={TaskId}，UvId={UvId}，资源={ResourceState}",
+                        phase, elapsed.TotalMilliseconds, run.TaskId, run.UvId, ResourceState());
+            });
+        }
+        IDisposable TrackCleanupPhase(string phase)
+        {
+            var name = phase switch
+            {
+                "cleanupContextClose" => "清理Context关闭",
+                "cleanupCloseQueue" => "清理驱动收尾排队",
+                "cleanupCancelRegistration" => "清理取消回调",
+                "cleanupBrowserClose" => "清理Browser关闭",
+                "cleanupTerminate" => "清理终止进程树",
+                "cleanupMainProcessExit" => "清理主进程退出",
+                "cleanupChildProcessExit" => "清理子进程退出",
+                "cleanupJobDispose" => "清理Job释放",
+                "cleanupCacheDrain" => "清理缓存回调",
+                "launchCdpDetach" => "启动CDP断开（后台）",
+                _ => phase
+            };
+            return new StartupTiming(_metrics.Track(name), elapsed =>
+            {
+                stages[phase + "Ms"] = elapsed.TotalMilliseconds;
+                if (elapsed.TotalSeconds >= 1)
+                    logger.Warning("浏览器辅助/清理慢阶段结束（含失败或取消），Phase={Phase}，ElapsedMs={ElapsedMs:F0}，TaskId={TaskId}，UvId={UvId}，资源={ResourceState}",
+                        phase, elapsed.TotalMilliseconds, run.TaskId, run.UvId, ResourceState());
+            });
+        }
+        void CleanupNotice(string message, Exception? error)
+        {
+            if (error is null)
+                logger.Information("浏览器清理诊断，TaskId={TaskId}，UvId={UvId}，Detail={Detail}，资源={ResourceState}", run.TaskId, run.UvId, message, ResourceState());
+            else
+                logger.Warning(error, "浏览器清理异常，TaskId={TaskId}，UvId={UvId}，Detail={Detail}，资源={ResourceState}", run.TaskId, run.UvId, message, ResourceState());
+        }
+        string ResourceState()
+        {
+            var sample = SystemPressureProbe.Shared.Latest;
+            return (sample.Available ? $"CPU={sample.CpuPercent:F1}%，可用物理内存={sample.AvailablePhysicalBytes / 1048576.0:F0}MiB，可用提交量={sample.AvailableCommitBytes / 1048576.0:F0}MiB"
+                : "资源采样尚不可用：" + sample.UnavailableReason)
+                + $"，启动排队={launches.WaitingStarts}，启动上限={launches.MaxConcurrentStarts}，当前资源启动额度={launches.EffectiveStartLimit}，DriverId={driverId}";
+        }
         var navigationWarnings = new List<string>();
-        var cacheTasks = new HashSet<Task>();
-        var cacheSync = new object();
+        EventHandler<IResponse>? cacheResponse = null;
         var cleanupDeferred = false;
         var gracefulContextCloseTimedOut = false;
         DeviceProfileResult? viewport = null;
         BrowserIpEnvironment? ipEnvironment = null;
         ulong browserPeakBytes = 0;
-        using var captureStop = CancellationTokenSource.CreateLinkedTokenSource(token);
+        int? browserProcessId = null;
+        await using var cacheCallbacks = new UvCacheCallbacks(token, ex =>
+            logger.Warning(ex, "UV缓存回调异常已隔离，TaskId={TaskId}，UvId={UvId}，DriverId={DriverId}", run.TaskId, run.UvId, driverId));
         var started = Stopwatch.GetTimestamp();
         try
         {
@@ -93,13 +169,32 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
             var timed = Stopwatch.GetTimestamp();
             await launches.ExecuteAsync(async () =>
             {
-                SetStage("browserStart");
-                var launchStarted = Stopwatch.GetTimestamp();
                 stages["launchQueueMs"] = Stopwatch.GetElapsedTime(timed).TotalMilliseconds;
                 _metrics.Stage("launchQueue", Stopwatch.GetElapsedTime(timed));
-                session = await OwnedChromeSession.StartAsync(playwright, CreateLaunchOptions(run, viewport, ipEnvironment), run.Directory, token).ConfigureAwait(false);
+                var selectedPlaywright = playwright;
+                if (drivers is not null)
+                {
+                    using (TrackLaunchPhase("driverStart"))
+                        driverUse.Lease = await drivers.AcquireAsync(run.WorkerId, token).ConfigureAwait(false);
+                    driverId = driverUse.Lease.Id;
+                    selectedPlaywright = driverUse.Lease.Driver;
+                }
+                if (selectedPlaywright is null) throw new InvalidOperationException("未配置Playwright驱动。");
+                SetStage("browserStart");
+                var launchStarted = Stopwatch.GetTimestamp();
+                var launchPressure = ResourceState();
+                session = await OwnedChromeSession.StartAsync(selectedPlaywright, CreateLaunchOptions(run, viewport, ipEnvironment), run.Directory, token,
+                    TrackLaunchPhase, TrackCleanupPhase, CleanupNotice, elapsed =>
+                    {
+                        stages["launchProcessAttachMs"] = elapsed.TotalMilliseconds;
+                        _metrics.Stage("启动进程绑定", elapsed);
+                    }, TimeSpan.FromMilliseconds(_business.BrowserCloseGraceMilliseconds), _metrics.BrowserStartAttempted,
+                    TrackCleanupPhase).ConfigureAwait(false);
+                browserProcessId = session.ProcessId;
                 stages["browserLaunchMs"] = Stopwatch.GetElapsedTime(launchStarted).TotalMilliseconds;
                 _metrics.Stage("browserLaunch", Stopwatch.GetElapsedTime(launchStarted));
+                logger.Information("浏览器启动诊断，TaskId={TaskId}，UvId={UvId}，PID={PID}，阶段毫秒={StageMilliseconds}，启动前={Before}，启动后={After}",
+                    run.TaskId, run.UvId, session.ProcessId, StageSnapshot().ToString(Newtonsoft.Json.Formatting.None), launchPressure, ResourceState());
                 _metrics.BrowserOpened();
                 lifetime.Watch(session.Browser!);
                 var setupStarted = Stopwatch.GetTimestamp();
@@ -150,24 +245,35 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
                     var partition = (run.Proxy?.PlaywrightServer ?? "direct") + "\n" + run.Proxy?.IpInfo?.ToString(Newtonsoft.Json.Formatting.None);
                     if (run.Options.IsCacheMode)
                     {
-                        page.Response += (_, response) =>
+                        var cachePolicy = new ResourceCachePolicy(run.Options);
+                        cacheResponse = (_, response) =>
                         {
-                            if (!cache.TryBeginCapture()) return;
-                            var write = RecordAsync(response, partition, captureStop.Token);
-                            lock (cacheSync)
-                            {
-                                cacheTasks.RemoveWhere(task => task.IsCompleted);
-                                cacheTasks.Add(write);
-                            }
+                            using var callbackWorker = WorkerExecutionContext.Enter(run.WorkerId);
+                            _ = cacheCallbacks.RunAsync(captureToken => RecordAsync(response, partition, captureToken, origins,
+                                run.TaskId, run.UvId, cachePolicy));
                         };
-                        await AwaitAsync(page.RouteAsync("**/*", route => ServeAsync(route, partition, token)), setupToken).ConfigureAwait(false);
+                        page.Response += cacheResponse;
+                        await AwaitAsync(page.RouteAsync("**/*", route =>
+                        {
+                            using var callbackWorker = WorkerExecutionContext.Enter(run.WorkerId);
+                            return cacheCallbacks.RunAsync(async captureToken =>
+                            {
+                                try { await ServeAsync(route, partition, captureToken, origins, cachePolicy).ConfigureAwait(false); }
+                                catch (Exception) when (captureToken.IsCancellationRequested) { }
+                                catch (Exception ex)
+                                {
+                                    logger.Debug(ex, "静态缓存路由失败，尝试原始网络请求，TaskId={TaskId}，UvId={UvId}", run.TaskId, run.UvId);
+                                    await AwaitAsync(route.FallbackAsync(), captureToken).ConfigureAwait(false);
+                                }
+                            });
+                        }), setupToken).ConfigureAwait(false);
                     }
                 }, _business.BrowserSetupTimeoutSeconds, () => stage, session.Abort, token).ConfigureAwait(false);
                 stages["browserSetupMs"] = Stopwatch.GetElapsedTime(setupStarted).TotalMilliseconds;
                 _metrics.Stage("browserSetup", Stopwatch.GetElapsedTime(setupStarted));
                 stages["browserStartMs"] = Stopwatch.GetElapsedTime(launchStarted).TotalMilliseconds;
                 _metrics.Stage("browserStart", Stopwatch.GetElapsedTime(launchStarted));
-            }, token).ConfigureAwait(false);
+            }, token, run.BrowserStartQueued).ConfigureAwait(false);
             stages["launchMs"] = Stopwatch.GetElapsedTime(timed).TotalMilliseconds;
             _metrics.Stage("launch", Stopwatch.GetElapsedTime(timed));
             token.ThrowIfCancellationRequested();
@@ -184,10 +290,11 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
                     var opened = await InitialPageNavigation.OpenAsync(page, run.Target.AbsoluteUri, logger,
                         run.TaskId, run.UvId, token, run.Options.PageLoadingTimeout).ConfigureAwait(false);
                     navigationWarnings.AddRange(opened.Warnings);
+                    _metrics.UvExposed();
                 }
                 else
                 {
-                    var response = await AwaitAsync(page.ReloadAsync(new() { WaitUntil = WaitUntilState.Load }), token).ConfigureAwait(false);
+                    var response = await AwaitAsync(page.ReloadAsync(new() { WaitUntil = WaitUntilState.DOMContentLoaded }), token).ConfigureAwait(false);
                     if (response?.Status is 644 or 407) throw new PageHttpStatusException(response.Status, response.Url);
                     if (response is null || !response.Ok)
                         throw new InvalidOperationException($"页面加载失败：HTTP {response?.Status}（第 {view}/{run.PageViews} 次访问）。");
@@ -233,13 +340,17 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
                 stages["storageMs"] = Stopwatch.GetElapsedTime(timed).TotalMilliseconds;
             }
             SetStage("cacheDrain");
-            // Bound each cache capture. No background writes outlive the UV.
-            Task[] pending;
-            lock (cacheSync) pending = cacheTasks.ToArray();
-            await Task.WhenAll(pending).ConfigureAwait(false);
+            // Finish current captures; teardown below closes admission and drains any late arrivals.
+            await cacheCallbacks.WaitCurrentAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
+            if (ex.Data["BrowserStartupPhase"] is string startupPhase)
+            {
+                stage = startupPhase;
+                logger.Warning(ex, "浏览器启动阶段失败，TaskId={TaskId}，UvId={UvId}，Phase={Phase}，阶段毫秒={StageMilliseconds}，资源={ResourceState}",
+                    run.TaskId, run.UvId, stage, StageSnapshot().ToString(Newtonsoft.Json.Formatting.None), ResourceState());
+            }
             // Classify only main-document browser failures, never failed images/scripts or cleanup messages.
             var proxyCode = ProxyUnavailableException.BrowserCode(latestDocumentFailure)
                 ?? (stage == "navigation" && ex is PlaywrightException ? ProxyUnavailableException.BrowserCode(ex.Message) : null);
@@ -249,7 +360,11 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
         finally
         {
             if (page is not null)
-            { page.Response -= documentResponse; page.RequestFailed -= documentFailure; }
+            {
+                page.Response -= documentResponse; page.RequestFailed -= documentFailure;
+                if (cacheResponse is not null) page.Response -= cacheResponse;
+            }
+            cacheCallbacks.Stop();
             activeStage?.Dispose();
             using var cleanupStage = _metrics.Track("清理");
             lifetime.StopWatching();
@@ -262,13 +377,13 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
                     run.TaskId, run.UvId, stage, closeReason);
             }
             var closing = Stopwatch.GetTimestamp();
-            captureStop.Cancel();
             if (context is not null)
             {
                 try
                 {
-                    gracefulContextCloseTimedOut = !await CloseContextGracefullyAsync(() => context.CloseAsync(),
-                    TimeSpan.FromSeconds(3), logger, run.TaskId, run.UvId).ConfigureAwait(false);
+                    using (TrackCleanupPhase("cleanupContextClose"))
+                        gracefulContextCloseTimedOut = !await CloseContextGracefullyAsync(() => context.CloseAsync(),
+                        TimeSpan.FromSeconds(3), logger, run.TaskId, run.UvId).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (token.IsCancellationRequested) { logger.Debug(ex, "取消后 Context 已退出"); }
                 catch (Exception ex) { errors.Add(ex); }
@@ -282,15 +397,23 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
                 finally { _metrics.BrowserClosed(); }
                 cleanupDeferred = session.ProfileCleanupDeferred;
             }
-            Task[] remaining;
-            lock (cacheSync) remaining = cacheTasks.ToArray();
-            await Task.WhenAll(remaining).ConfigureAwait(false);
+            using (TrackCleanupPhase("cleanupCacheDrain"))
+            {
+                await cacheCallbacks.DrainAsync().ConfigureAwait(false);
+                foreach (var origin in origins.Values) origin.Dispose();
+                origins.Clear();
+            }
             stages["cleanupMs"] = Stopwatch.GetElapsedTime(closing).TotalMilliseconds;
             _metrics.Stage("cleanup", Stopwatch.GetElapsedTime(closing));
+            logger.Information("浏览器清理汇总，TaskId={TaskId}，UvId={UvId}，ContextCloseTimedOut={ContextCloseTimedOut}，阶段毫秒={StageMilliseconds}，资源={ResourceState}",
+                run.TaskId, run.UvId, gracefulContextCloseTimedOut, StageSnapshot().ToString(Newtonsoft.Json.Formatting.None), ResourceState());
             if (_business.ExportRunData) await File.WriteAllTextAsync(Path.Combine(run.Directory, "result.json"), new JObject
             {
                 ["taskId"] = run.TaskId,
                 ["uvId"] = run.UvId,
+                ["workerId"] = run.WorkerId,
+                ["driverId"] = driverId,
+                ["browserProcessId"] = browserProcessId,
                 ["deviceKey"] = run.Device.DeviceKey,
                 ["hiddenMode"] = run.Options.IsHiddenMode,
                 ["proxyServer"] = run.Proxy?.Server,
@@ -302,11 +425,12 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
                 ["browserInterrupted"] = lifetime.Reason is not null && !cancellationToken.IsCancellationRequested,
                 ["browserInterruptionReason"] = lifetime.Reason,
                 ["profileCleanupDeferred"] = cleanupDeferred,
+                ["startupCdpDetachDeferred"] = session?.StartupCdpDetachDeferred ?? false,
                 ["browserPeakCommittedBytes"] = browserPeakBytes,
                 ["gracefulContextCloseTimedOut"] = gracefulContextCloseTimedOut,
                 ["viewport"] = viewport is null ? JValue.CreateNull() : JObject.FromObject(viewport),
                 ["elapsedMs"] = Stopwatch.GetElapsedTime(started).TotalMilliseconds,
-                ["stages"] = stages,
+                ["stages"] = StageSnapshot(),
                 ["errors"] = new JArray(errors.Select(error => error.Message).ToArray()),
                 ["navigationWarnings"] = new JArray(navigationWarnings)
             }.ToString(), CancellationToken.None).ConfigureAwait(false);
@@ -334,46 +458,87 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
         return Task.CompletedTask;
     }
 
-    internal async Task ServeAsync(IRoute route, string partition, CancellationToken token)
+    internal async Task ServeAsync(IRoute route, string partition, CancellationToken token,
+        ConcurrentDictionary<IRequest, CacheAccess>? origins = null, ResourceCachePolicy? policy = null)
     {
+        if (policy?.Bypass(route.Request.ResourceType, route.Request.Url) == true)
+        { await AwaitAsync(route.FallbackAsync(), token).ConfigureAwait(false); return; }
         if (route.Request.Method == "GET" && (IsCacheableResource(route.Request.ResourceType) || IsVideoUrl(route.Request.Url)) && !IsGifUrl(route.Request.Url))
         {
             var headers = new Dictionary<string, string>(await AwaitAsync(route.Request.AllHeadersAsync(), token).ConfigureAwait(false));
-            // URL-only reuse is explicitly enabled, independent of request identity.
-            using var hit = await cache.TryGetFileAsync(SharedStaticResourceCache.RequestKey(route.Request.Url, headers, partition), token).ConfigureAwait(false);
-            _metrics.CacheLookup(hit is not null);
-            if (hit is not null)
+            var key = SharedStaticResourceCache.RequestKey(route.Request.Url, headers, partition);
+            CacheAccess? access = null;
+            try { access = await cache.AcquireAsync(key, token).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+            catch (Exception ex) { logger.Debug(ex, "静态缓存协调失败，继续浏览器原始请求"); }
+            if (access is not null)
             {
-                await route.FulfillAsync(new()
+                try
                 {
-                    Status = hit.Status, ContentType = hit.Headers.GetValueOrDefault("content-type", hit.ContentType),
-                    Headers = hit.Headers, Path = hit.Path
-                }).ConfigureAwait(false);
+                    var hit = access.Hit;
+                    _metrics.CacheLookup(hit is not null);
+                    if (hit is not null)
+                    {
+                        var responseHeaders = cache.Headers(hit);
+                        await AwaitAsync(route.FulfillAsync(new()
+                        {
+                            Status = hit.Metadata.StatusCode, ContentType = responseHeaders.GetValueOrDefault("content-type", hit.Metadata.ContentType),
+                            Headers = responseHeaders, Path = hit.FilePath,
+                            BodyBytes = hit.Tier == CacheTier.Memory ? hit.Body.ToArray() : null
+                        }), token).ConfigureAwait(false);
+                        return;
+                    }
+                    if (access.IsOwner && origins is not null && origins.TryAdd(route.Request, access))
+                    {
+                        // The response callback owns this ticket until its body has been published.
+                        try { await AwaitAsync(route.FallbackAsync(), token).ConfigureAwait(false); }
+                        catch { if (origins.TryRemove(route.Request, out var failed)) failed.Dispose(); throw; }
+                        access = null; // Ownership was transferred to the response callback.
+                    }
+                    else await AwaitAsync(route.FallbackAsync(), token).ConfigureAwait(false);
+                }
+                finally { access?.Dispose(); }
                 return;
             }
         }
-        await route.FallbackAsync().ConfigureAwait(false);
+        await AwaitAsync(route.FallbackAsync(), token).ConfigureAwait(false);
     }
 
-    internal async Task RecordAsync(IResponse response, string partition, CancellationToken token)
+    internal async Task RecordAsync(IResponse response, string partition, CancellationToken token,
+        ConcurrentDictionary<IRequest, CacheAccess>? origins = null, long taskId = 0, long uvId = 0, ResourceCachePolicy? policy = null)
     {
         try
         {
+            if (policy?.Bypass(response.Request.ResourceType, response.Url) == true) return;
             if (response.Request.Method != "GET" || !(IsCacheableResource(response.Request.ResourceType) || IsVideoUrl(response.Request.Url))
                 || response.Status is not (200 or 206) || IsGifUrl(response.Request.Url)) return;
-            var headers = new Dictionary<string, string>(await AwaitAsync(response.AllHeadersAsync(), token).ConfigureAwait(false));
-            var request = new Dictionary<string, string>(await AwaitAsync(response.Request.AllHeadersAsync(), token).ConfigureAwait(false));
+            Dictionary<string, string> headers, request;
+            using (TrackCapture("缓存响应头读取", response.Url, taskId, uvId))
+            {
+                headers = new(await AwaitAsync(response.AllHeadersAsync(), token).ConfigureAwait(false));
+                request = new(await AwaitAsync(response.Request.AllHeadersAsync(), token).ConfigureAwait(false));
+            }
             var contentType = headers.GetValueOrDefault("content-type", "").Split(';', 2)[0].Trim();
             if (!IsCacheableContentType(contentType)) return;
             var key = SharedStaticResourceCache.RequestKey(response.Request.Url, request, partition);
-            using (var existing = await cache.TryGetFileAsync(key, token).ConfigureAwait(false))
+            using (TrackCapture("缓存采集查重", response.Url, taskId, uvId))
+            using (var existing = await cache.TryGetResourceAsync(key, token).ConfigureAwait(false))
                 if (existing is not null) return; // Do not re-capture hits or extend their configured TTL.
             // Playwright returns the decoded body, including gzip/br and chunked responses.
             // There is no per-resource size or two-second capture limit; UV cancellation still applies.
-            var bodyTask = response.BodyAsync();
             byte[] body;
-            try { body = await bodyTask.WaitAsync(token).ConfigureAwait(false); }
-            catch { _ = bodyTask.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted); throw; }
+            using (TrackCapture("缓存采集排队", response.Url, taskId, uvId))
+                await cache.BeginCaptureAsync(token).ConfigureAwait(false);
+            try
+            {
+                using (TrackCapture("缓存正文读取", response.Url, taskId, uvId))
+                {
+                    var bodyTask = response.BodyAsync();
+                    try { body = await bodyTask.WaitAsync(token).ConfigureAwait(false); }
+                    catch { _ = bodyTask.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted); throw; }
+                }
+            }
+            finally { cache.EndCapture(); }
             if (!headers.ContainsKey("content-encoding") && long.TryParse(headers.GetValueOrDefault("content-length"), out var length)
                 && body.LongLength != length) return;
             if (response.Status == 206)
@@ -387,11 +552,55 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
             }
             foreach (var header in new[] { "content-length", "content-encoding", "transfer-encoding", "connection", "keep-alive",
                 "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade", "content-md5", "digest", "etag", "set-cookie" }) headers.Remove(header);
-            await cache.StoreAsync(key,
-                contentType, headers, body, token, response.Status).ConfigureAwait(false);
+            using (TrackCapture("缓存写入", response.Url, taskId, uvId, body.LongLength))
+            {
+                var deduplicateBody = (policy?.DeduplicateJavaScript ?? true)
+                    && SharedStaticResourceCache.ShouldDeduplicateJavaScript(response.Request.Method, response.Url);
+                if (origins is not null && origins.TryGetValue(response.Request, out var owner) && owner.IsOwner)
+                    await cache.StoreOwnedAsync(owner, key, contentType, headers, body, token, response.Status, deduplicateBody).ConfigureAwait(false);
+                else await cache.StoreAsync(key, contentType, headers, body, token, response.Status, deduplicateBody).ConfigureAwait(false);
+            }
         }
         catch (Exception ex) { logger.Debug(ex, "静态缓存记录已放弃"); }
-        finally { cache.EndCapture(); }
+        finally
+        {
+            if (origins is not null && origins.TryRemove(response.Request, out var completed)) completed.Dispose();
+        }
+    }
+    private sealed class StartupTiming(IDisposable active, Action<TimeSpan> finished) : IDisposable
+    {
+        private readonly long _started = Stopwatch.GetTimestamp();
+        private int _disposed;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            active.Dispose();
+            finished(Stopwatch.GetElapsedTime(_started));
+        }
+    }
+
+    private IDisposable TrackCapture(string phase, string url, long taskId, long uvId, long? bytes = null)
+        => new CaptureTiming(_metrics, logger, new(phase, url, taskId, uvId, WorkerExecutionContext.WorkerId, 0), bytes);
+
+    private sealed class CaptureTiming : IDisposable
+    {
+        private readonly IDisposable _scope;
+        private readonly ILogger _logger;
+        private readonly CacheResourceStage _resource;
+        private readonly long? _bytes;
+        private readonly long _started = Stopwatch.GetTimestamp();
+        private int _disposed;
+        internal CaptureTiming(BusinessMetrics metrics, ILogger logger, CacheResourceStage resource, long? bytes)
+        { _logger = logger; _resource = resource; _bytes = bytes; _scope = metrics.Track(resource.Stage, resource); }
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            _scope.Dispose();
+            var elapsed = Stopwatch.GetElapsedTime(_started);
+            if (elapsed.TotalSeconds >= 3)
+                _logger.Warning("缓存采集慢阶段结束（含失败或取消），Phase={Phase}，ElapsedMs={ElapsedMs:F0}，TaskId={TaskId}，UvId={UvId}，Bytes={Bytes}，Url={Url}",
+                    _resource.Stage, elapsed.TotalMilliseconds, _resource.TaskId, _resource.UvId, _bytes, _resource.Url);
+        }
     }
     internal static async Task<bool> CloseContextGracefullyAsync(Func<Task> closeContext, TimeSpan timeout,
         ILogger logger, long taskId, long uvId)
@@ -463,6 +672,7 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
         && Uri.UnescapeDataString(uri.AbsolutePath).EndsWith(".gif", StringComparison.OrdinalIgnoreCase);
     internal BrowserTypeLaunchOptions CreateLaunchOptions(BusinessUvRun run, DeviceProfileResult? viewport = null, BrowserIpEnvironment? ipEnvironment = null)
     {
+
         var device = run.Device;
         var executable = Path.GetFullPath(_business.ChromeExecutablePath, AppContext.BaseDirectory);
         if (!File.Exists(executable)) throw new FileNotFoundException("找不到 Chrome 145。", executable);
@@ -557,6 +767,7 @@ public sealed class BusinessUvBrowserRunner(IPlaywright playwright, BrowserLaunc
     {
         ["taskId"] = run.TaskId,
         ["uvId"] = run.UvId,
+        ["workerId"] = run.WorkerId,
         ["deviceKey"] = run.Device.DeviceKey,
         ["pageViews"] = run.PageViews,
         ["jstext"] = run.Jstext

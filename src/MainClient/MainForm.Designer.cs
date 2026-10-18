@@ -47,8 +47,16 @@ namespace TrafficVista
             numericUpDown_PageLoadingTimeout = new NumericUpDown();
             checkBox_VerboseLog = new CheckBox();
             checkBox_IsHiddenMode = new CheckBox();
+            checkBox_TaskIntakeBackpressure = new CheckBox();
+            numericUpDown_AutoRestartMinutes = new NumericUpDown();
+            label_AutoRestart = new Label();
+            label_AutoRestartHint = new Label();
             checkBox_IsProxyMode = new CheckBox();
             checkBox_IsCacheMode = new CheckBox();
+            groupBox_Cache = new GroupBox();
+            comboBox_JavaScriptCacheMode = new ComboBox();
+            textBox_CacheExcludedUrlPrefixes = new TextBox();
+            label_JsCacheHint = new Label();
             checkBox_RealIp = new CheckBox();
             checkBox_IpDetails = new CheckBox();
             textBox_ProxyIpUrl = new TextBox();
@@ -60,8 +68,9 @@ namespace TrafficVista
             label2 = new Label();
             label3 = new Label();
             numericUpDown_MaxConcurrency = new NumericUpDown();
-            numericUpDown_TaskWorkers = new NumericUpDown();
-            label_TaskWorkers = new Label();
+            numericUpDown_PlaywrightDriverCount = new NumericUpDown();
+            label_PlaywrightDriverCount = new Label();
+            label_PlaywrightDriverHint = new Label();
             label27 = new Label();
             panel1 = new Panel();
             linkLabel2 = new LinkLabel();
@@ -84,9 +93,10 @@ namespace TrafficVista
             statusMetricsPanel.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize)numericUpDown_Multiple).BeginInit();
             ((System.ComponentModel.ISupportInitialize)numericUpDown_PageLoadingTimeout).BeginInit();
+            groupBox_Cache.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize)numericUpDown_TaskFetchInterval).BeginInit();
             ((System.ComponentModel.ISupportInitialize)numericUpDown_MaxConcurrency).BeginInit();
-            ((System.ComponentModel.ISupportInitialize)numericUpDown_TaskWorkers).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)numericUpDown_PlaywrightDriverCount).BeginInit();
             panel1.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize)numericUpDown_IpTtl).BeginInit();
             ((System.ComponentModel.ISupportInitialize)numericUpDown_AcquireRetry).BeginInit();
@@ -120,7 +130,7 @@ namespace TrafficVista
             statusMetricsPanel.Controls.Add(label_Status);
             statusMetricsPanel.Dock = DockStyle.Right;
             statusMetricsPanel.Location = new Point(1011, 0);
-            statusMetricsPanel.Margin = new Padding(4, 4, 4, 4);
+            statusMetricsPanel.Margin = new Padding(4);
             statusMetricsPanel.Name = "statusMetricsPanel";
             statusMetricsPanel.Size = new Size(443, 959);
             statusMetricsPanel.TabIndex = 156;
@@ -128,17 +138,17 @@ namespace TrafficVista
             // liveLogView
             // 
             liveLogView.Dock = DockStyle.Fill;
-            liveLogView.Location = new Point(0, 392);
-            liveLogView.Margin = new Padding(4, 4, 4, 4);
+            liveLogView.Location = new Point(0, 496);
+            liveLogView.Margin = new Padding(4);
             liveLogView.Name = "liveLogView";
-            liveLogView.Padding = new Padding(7, 7, 7, 7);
-            liveLogView.Size = new Size(1011, 567);
+            liveLogView.Padding = new Padding(7);
+            liveLogView.Size = new Size(1011, 463);
             liveLogView.TabIndex = 155;
             // 
             // btnStartStop
             // 
             btnStartStop.Location = new Point(824, 16);
-            btnStartStop.Margin = new Padding(4, 4, 4, 4);
+            btnStartStop.Margin = new Padding(4);
             btnStartStop.Name = "btnStartStop";
             btnStartStop.Size = new Size(150, 112);
             btnStartStop.TabIndex = 0;
@@ -248,7 +258,7 @@ namespace TrafficVista
             // 
             checkBox_VerboseLog.AutoSize = true;
             checkBox_VerboseLog.Location = new Point(863, 214);
-            checkBox_VerboseLog.Margin = new Padding(6, 6, 6, 6);
+            checkBox_VerboseLog.Margin = new Padding(6);
             checkBox_VerboseLog.Name = "checkBox_VerboseLog";
             checkBox_VerboseLog.Size = new Size(108, 28);
             checkBox_VerboseLog.TabIndex = 132;
@@ -259,7 +269,7 @@ namespace TrafficVista
             // 
             checkBox_IsHiddenMode.AutoSize = true;
             checkBox_IsHiddenMode.Location = new Point(863, 139);
-            checkBox_IsHiddenMode.Margin = new Padding(6, 6, 6, 6);
+            checkBox_IsHiddenMode.Margin = new Padding(6);
             checkBox_IsHiddenMode.Name = "checkBox_IsHiddenMode";
             checkBox_IsHiddenMode.Size = new Size(108, 28);
             checkBox_IsHiddenMode.TabIndex = 127;
@@ -270,7 +280,7 @@ namespace TrafficVista
             // 
             checkBox_IsProxyMode.AutoSize = true;
             checkBox_IsProxyMode.Location = new Point(863, 176);
-            checkBox_IsProxyMode.Margin = new Padding(6, 6, 6, 6);
+            checkBox_IsProxyMode.Margin = new Padding(6);
             checkBox_IsProxyMode.Name = "checkBox_IsProxyMode";
             checkBox_IsProxyMode.Size = new Size(108, 28);
             checkBox_IsProxyMode.TabIndex = 128;
@@ -280,19 +290,62 @@ namespace TrafficVista
             // checkBox_IsCacheMode
             // 
             checkBox_IsCacheMode.AutoSize = true;
-            checkBox_IsCacheMode.Location = new Point(863, 251);
-            checkBox_IsCacheMode.Margin = new Padding(6, 6, 6, 6);
+            checkBox_IsCacheMode.Location = new Point(18, 28);
+            checkBox_IsCacheMode.Margin = new Padding(6);
             checkBox_IsCacheMode.Name = "checkBox_IsCacheMode";
-            checkBox_IsCacheMode.Size = new Size(144, 28);
+            checkBox_IsCacheMode.Size = new Size(108, 28);
             checkBox_IsCacheMode.TabIndex = 134;
-            checkBox_IsCacheMode.Text = "使用缓存模式";
+            checkBox_IsCacheMode.Text = "启用缓存";
             checkBox_IsCacheMode.UseVisualStyleBackColor = true;
+            // 
+            // groupBox_Cache
+            // 
+            groupBox_Cache.Controls.Add(checkBox_IsCacheMode);
+            groupBox_Cache.Controls.Add(comboBox_JavaScriptCacheMode);
+            groupBox_Cache.Controls.Add(textBox_CacheExcludedUrlPrefixes);
+            groupBox_Cache.Controls.Add(label_JsCacheHint);
+            groupBox_Cache.Location = new Point(350, 250);
+            groupBox_Cache.Name = "groupBox_Cache";
+            groupBox_Cache.Size = new Size(340, 235);
+            groupBox_Cache.TabIndex = 157;
+            groupBox_Cache.TabStop = false;
+            groupBox_Cache.Text = "资源缓存";
+            // 
+            // comboBox_JavaScriptCacheMode
+            // 
+            comboBox_JavaScriptCacheMode.DropDownStyle = ComboBoxStyle.DropDownList;
+            comboBox_JavaScriptCacheMode.Items.AddRange(new object[] { "1：JS不缓存", "2：JS URL缓存模式", "3：JS URL＋内容缓存模式" });
+            comboBox_JavaScriptCacheMode.Location = new Point(18, 65);
+            comboBox_JavaScriptCacheMode.Name = "comboBox_JavaScriptCacheMode";
+            comboBox_JavaScriptCacheMode.Size = new Size(304, 32);
+            comboBox_JavaScriptCacheMode.TabIndex = 1;
+            // 
+            // textBox_CacheExcludedUrlPrefixes
+            // 
+            textBox_CacheExcludedUrlPrefixes.AcceptsReturn = true;
+            textBox_CacheExcludedUrlPrefixes.Location = new Point(18, 140);
+            textBox_CacheExcludedUrlPrefixes.Multiline = true;
+            textBox_CacheExcludedUrlPrefixes.Name = "textBox_CacheExcludedUrlPrefixes";
+            textBox_CacheExcludedUrlPrefixes.ScrollBars = ScrollBars.Vertical;
+            textBox_CacheExcludedUrlPrefixes.Size = new Size(304, 78);
+            textBox_CacheExcludedUrlPrefixes.TabIndex = 2;
+            textBox_CacheExcludedUrlPrefixes.WordWrap = false;
+            // 
+            // label_JsCacheHint
+            // 
+            label_JsCacheHint.AutoSize = true;
+            label_JsCacheHint.ForeColor = SystemColors.GrayText;
+            label_JsCacheHint.Location = new Point(18, 108);
+            label_JsCacheHint.Name = "label_JsCacheHint";
+            label_JsCacheHint.Size = new Size(259, 24);
+            label_JsCacheHint.TabIndex = 135;
+            label_JsCacheHint.Text = "JS不缓存URL前缀（每行一条）";
             // 
             // checkBox_RealIp
             // 
             checkBox_RealIp.AutoSize = true;
             checkBox_RealIp.Location = new Point(863, 290);
-            checkBox_RealIp.Margin = new Padding(4, 4, 4, 4);
+            checkBox_RealIp.Margin = new Padding(4);
             checkBox_RealIp.Name = "checkBox_RealIp";
             checkBox_RealIp.Size = new Size(88, 28);
             checkBox_RealIp.TabIndex = 143;
@@ -303,12 +356,38 @@ namespace TrafficVista
             // 
             checkBox_IpDetails.AutoSize = true;
             checkBox_IpDetails.Location = new Point(863, 330);
-            checkBox_IpDetails.Margin = new Padding(4, 4, 4, 4);
+            checkBox_IpDetails.Margin = new Padding(4);
             checkBox_IpDetails.Name = "checkBox_IpDetails";
             checkBox_IpDetails.Size = new Size(88, 28);
             checkBox_IpDetails.TabIndex = 144;
             checkBox_IpDetails.Text = "IP详情";
             checkBox_IpDetails.UseVisualStyleBackColor = true;
+            //
+            // checkBox_TaskIntakeBackpressure
+            //
+            checkBox_TaskIntakeBackpressure.AutoSize = true;
+            checkBox_TaskIntakeBackpressure.Location = new Point(840, 370);
+            checkBox_TaskIntakeBackpressure.Name = "checkBox_TaskIntakeBackpressure";
+            checkBox_TaskIntakeBackpressure.TabIndex = 158;
+            checkBox_TaskIntakeBackpressure.Text = "任务领取背压";
+            checkBox_TaskIntakeBackpressure.UseVisualStyleBackColor = true;
+            //
+            // Periodic graceful restart
+            //
+            label_AutoRestart.AutoSize = true;
+            label_AutoRestart.Location = new Point(704, 411);
+            label_AutoRestart.Name = "label_AutoRestart";
+            label_AutoRestart.Text = "定时重启";
+            numericUpDown_AutoRestartMinutes.Location = new Point(802, 406);
+            numericUpDown_AutoRestartMinutes.Maximum = 10080;
+            numericUpDown_AutoRestartMinutes.Name = "numericUpDown_AutoRestartMinutes";
+            numericUpDown_AutoRestartMinutes.Size = new Size(90, 30);
+            numericUpDown_AutoRestartMinutes.TabIndex = 161;
+            label_AutoRestartHint.Location = new Point(704, 444);
+            label_AutoRestartHint.Size = new Size(290, 46);
+            label_AutoRestartHint.Name = "label_AutoRestartHint";
+            label_AutoRestartHint.Text = "单位：分钟；0为关闭\n到时暂存队列，等在途任务完成";
+            label_AutoRestartHint.ForeColor = SystemColors.GrayText;
             // 
             // textBox_ProxyIpUrl
             // 
@@ -400,36 +479,41 @@ namespace TrafficVista
             numericUpDown_MaxConcurrency.TabIndex = 121;
             numericUpDown_MaxConcurrency.Value = new decimal(new int[] { 1, 0, 0, 0 });
             // 
-            // numericUpDown_TaskWorkers
+            // numericUpDown_PlaywrightDriverCount
             // 
-            numericUpDown_TaskWorkers.Location = new Point(473, 253);
-            numericUpDown_TaskWorkers.Margin = new Padding(4, 4, 4, 4);
-            numericUpDown_TaskWorkers.Maximum = new decimal(new int[] { 1024, 0, 0, 0 });
-            numericUpDown_TaskWorkers.Minimum = new decimal(new int[] { 1, 0, 0, 0 });
-            numericUpDown_TaskWorkers.Name = "numericUpDown_TaskWorkers";
-            numericUpDown_TaskWorkers.Size = new Size(98, 30);
-            numericUpDown_TaskWorkers.TabIndex = 156;
-            numericUpDown_TaskWorkers.Value = new decimal(new int[] { 4, 0, 0, 0 });
+            numericUpDown_PlaywrightDriverCount.Location = new Point(180, 374);
+            numericUpDown_PlaywrightDriverCount.Maximum = new decimal(new int[] { 1024, 0, 0, 0 });
+            numericUpDown_PlaywrightDriverCount.Name = "numericUpDown_PlaywrightDriverCount";
+            numericUpDown_PlaywrightDriverCount.Size = new Size(91, 30);
+            numericUpDown_PlaywrightDriverCount.TabIndex = 158;
+            numericUpDown_PlaywrightDriverCount.Value = new decimal(new int[] { 1, 0, 0, 0 });
             // 
-            // label_TaskWorkers
+            // label_PlaywrightDriverCount
             // 
-            label_TaskWorkers.AutoSize = true;
-            label_TaskWorkers.Location = new Point(329, 257);
-            label_TaskWorkers.Margin = new Padding(4, 0, 4, 0);
-            label_TaskWorkers.Name = "label_TaskWorkers";
-            label_TaskWorkers.Size = new Size(127, 24);
-            label_TaskWorkers.TabIndex = 154;
-            label_TaskWorkers.Text = "任务Worker数";
+            label_PlaywrightDriverCount.AutoSize = true;
+            label_PlaywrightDriverCount.Location = new Point(13, 379);
+            label_PlaywrightDriverCount.Name = "label_PlaywrightDriverCount";
+            label_PlaywrightDriverCount.Size = new Size(156, 24);
+            label_PlaywrightDriverCount.TabIndex = 159;
+            label_PlaywrightDriverCount.Text = "Playwright驱动数";
+            // 
+            // label_PlaywrightDriverHint
+            // 
+            label_PlaywrightDriverHint.Location = new Point(18, 412);
+            label_PlaywrightDriverHint.Name = "label_PlaywrightDriverHint";
+            label_PlaywrightDriverHint.Size = new Size(310, 74);
+            label_PlaywrightDriverHint.TabIndex = 160;
+            label_PlaywrightDriverHint.Text = "0：跟随任务并发\n1：共用驱动；大于1：指定数量\n按需创建，下一轮启动生效";
             // 
             // label27
             // 
             label27.AutoSize = true;
-            label27.Location = new Point(70, 257);
+            label27.Location = new Point(45, 257);
             label27.Margin = new Padding(6, 0, 6, 0);
             label27.Name = "label27";
-            label27.Size = new Size(82, 24);
+            label27.Size = new Size(100, 24);
             label27.TabIndex = 120;
-            label27.Text = "并发数量";
+            label27.Text = "任务并发数";
             // 
             // panel1
             // 
@@ -451,6 +535,9 @@ namespace TrafficVista
             panel1.Controls.Add(label27);
             panel1.Controls.Add(label110);
             panel1.Controls.Add(numericUpDown_MaxConcurrency);
+            panel1.Controls.Add(numericUpDown_PlaywrightDriverCount);
+            panel1.Controls.Add(label_PlaywrightDriverCount);
+            panel1.Controls.Add(label_PlaywrightDriverHint);
             panel1.Controls.Add(textBox_TaskName);
             panel1.Controls.Add(label3);
             panel1.Controls.Add(label4);
@@ -467,19 +554,22 @@ namespace TrafficVista
             panel1.Controls.Add(checkBox_IsHiddenMode);
             panel1.Controls.Add(label1);
             panel1.Controls.Add(checkBox_IsProxyMode);
-            panel1.Controls.Add(checkBox_IsCacheMode);
+            panel1.Controls.Add(groupBox_Cache);
             panel1.Controls.Add(checkBox_RealIp);
             panel1.Controls.Add(checkBox_IpDetails);
+            panel1.Controls.Add(checkBox_TaskIntakeBackpressure);
+            panel1.Controls.Add(numericUpDown_AutoRestartMinutes);
+            panel1.Controls.Add(label_AutoRestart);
+            panel1.Controls.Add(label_AutoRestartHint);
             panel1.Controls.Add(linkLabel1);
             panel1.Controls.Add(textBox_ProxyIpUrl);
-            panel1.Controls.Add(label_TaskWorkers);
-            panel1.Controls.Add(numericUpDown_TaskWorkers);
             panel1.Dock = DockStyle.Top;
             panel1.Location = new Point(0, 0);
-            panel1.Margin = new Padding(4, 4, 4, 4);
+            panel1.Margin = new Padding(4);
             panel1.Name = "panel1";
-            panel1.Size = new Size(1011, 392);
+            panel1.Size = new Size(1011, 496);
             panel1.TabIndex = 142;
+            panel1.Paint += panel1_Paint;
             // 
             // linkLabel2
             // 
@@ -636,24 +726,28 @@ namespace TrafficVista
             // 
             // MainForm
             // 
-            AutoScaleDimensions = new SizeF(11F, 24F);
-            AutoScaleMode = AutoScaleMode.Font;
+            // Original designer coordinates were authored at 150% (144 DPI).
+            AutoScaleDimensions = new SizeF(144F, 144F);
+            AutoScaleMode = AutoScaleMode.Dpi;
             ClientSize = new Size(1454, 990);
             Controls.Add(liveLogView);
             Controls.Add(panel1);
             Controls.Add(statusMetricsPanel);
             Controls.Add(statusStrip1);
-            Margin = new Padding(4, 4, 4, 4);
+            Margin = new Padding(4);
             MinimumSize = new Size(1034, 589);
             Name = "MainForm";
             Text = "TrafficVista(v20261014-1)";
+            Load += MainForm_Load;
             statusMetricsPanel.ResumeLayout(false);
             statusMetricsPanel.PerformLayout();
             ((System.ComponentModel.ISupportInitialize)numericUpDown_Multiple).EndInit();
             ((System.ComponentModel.ISupportInitialize)numericUpDown_PageLoadingTimeout).EndInit();
+            groupBox_Cache.ResumeLayout(false);
+            groupBox_Cache.PerformLayout();
             ((System.ComponentModel.ISupportInitialize)numericUpDown_TaskFetchInterval).EndInit();
             ((System.ComponentModel.ISupportInitialize)numericUpDown_MaxConcurrency).EndInit();
-            ((System.ComponentModel.ISupportInitialize)numericUpDown_TaskWorkers).EndInit();
+            ((System.ComponentModel.ISupportInitialize)numericUpDown_PlaywrightDriverCount).EndInit();
             panel1.ResumeLayout(false);
             panel1.PerformLayout();
             ((System.ComponentModel.ISupportInitialize)numericUpDown_IpTtl).EndInit();
@@ -683,6 +777,10 @@ namespace TrafficVista
         private CheckBox checkBox_IsHiddenMode;
         private CheckBox checkBox_IsProxyMode;
         private CheckBox checkBox_IsCacheMode;
+        private GroupBox groupBox_Cache;
+        private ComboBox comboBox_JavaScriptCacheMode;
+        private TextBox textBox_CacheExcludedUrlPrefixes;
+        private Label label_JsCacheHint;
         private CheckBox checkBox_RealIp;
         private CheckBox checkBox_IpDetails;
         private TextBox textBox_ProxyIpUrl;
@@ -694,8 +792,9 @@ namespace TrafficVista
         private Label label2;
         private Label label3;
         private NumericUpDown numericUpDown_MaxConcurrency;
-        private NumericUpDown numericUpDown_TaskWorkers;
-        private Label label_TaskWorkers;
+        private NumericUpDown numericUpDown_PlaywrightDriverCount;
+        private Label label_PlaywrightDriverCount;
+        private Label label_PlaywrightDriverHint;
         private Label label27;
         private Panel panel1;
         private TextBox textBox_DevApiUrl;
@@ -711,6 +810,9 @@ namespace TrafficVista
         private Label label_AcquireRetryUnit;
         private LinkLabel linkLabel2;
         private Label label_Status;
+        private CheckBox checkBox_TaskIntakeBackpressure;
+        private NumericUpDown numericUpDown_AutoRestartMinutes;
+        private Label label_AutoRestart, label_AutoRestartHint;
         private UiLogging.LiveLogView liveLogView;
         private System.Windows.Forms.Timer refreshTimer;
         private System.Windows.Forms.Timer saveSettingsTimer;

@@ -22,6 +22,8 @@ public sealed class ProxyService : IProxyService, IDisposable
     private readonly IProxyIpInfoProvider _ipInfo;
     private readonly ILogger _logger;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _vendorGates = new(StringComparer.OrdinalIgnoreCase);
+    // All workers and vendors share one acquisition lane. IP detail queries run after release.
+    private readonly SemaphoreSlim _acquireGate = new(1, 1);
 
     public ProxyService(NetOptions options, ProxyProviderRouter router, IProxyIpInfoProvider ipInfo, ILogger logger)
     {
@@ -49,6 +51,7 @@ public sealed class ProxyService : IProxyService, IDisposable
             throw new ProxyServiceException(adapter.VendorId, "route",
                 $"供应商“{adapter.VendorId}”的领取接口 URL 未配置或不合法（调用方传入与 Net:Vendors 配置均不可用）。");
         var totalAttempts = Math.Clamp(_options.AcquireRetryCount, 0, 10) + 1;
+        var retryInterval = _options.AcquireRetryIntervalMilliseconds;
         for (var attempt = 1; ; attempt++)
         {
             try
@@ -58,8 +61,9 @@ public sealed class ProxyService : IProxyService, IDisposable
             catch (ProxyServiceException ex) when (attempt < totalAttempts)
             {
                 // 瑕疵代理（或领取失败/超时/过期）：丢弃，换一个全新代理重试；取消走 OperationCanceledException，不重试。
-                _logger.Warning("代理获取第 {Attempt}/{Total} 次尝试失败，Vendor={Vendor}，Phase={Phase}，丢弃并换代理重试：{Reason}",
-                    attempt, totalAttempts, ex.VendorId, ex.Phase, ex.Message);
+                _logger.Warning("代理获取第 {Attempt}/{Total} 次尝试失败，Vendor={Vendor}，Phase={Phase}，等待 {RetryIntervalMs} 毫秒后丢弃并换代理重试：{Reason}",
+                    attempt, totalAttempts, ex.VendorId, ex.Phase, retryInterval, ex.Message);
+                await Task.Delay(retryInterval, cancellationToken).ConfigureAwait(false);
             }
         }
     }
@@ -78,8 +82,13 @@ public sealed class ProxyService : IProxyService, IDisposable
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            endpoint = await adapter.AcquireProxyAsync(apiUrl, request, cancellationToken).ConfigureAwait(false)
-                ?? throw new ProxyProtocolException($"供应商 {id} 适配器返回了空代理。");
+            await _acquireGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                endpoint = await adapter.AcquireProxyAsync(apiUrl, request, cancellationToken).ConfigureAwait(false)
+                    ?? throw new ProxyProtocolException($"供应商 {id} 适配器返回了空代理。");
+            }
+            finally { _acquireGate.Release(); }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -92,10 +101,10 @@ public sealed class ProxyService : IProxyService, IDisposable
             // URL 中的 secret 等凭证绝不写入日志：异常文本包含凭证值时改为记录脱敏原因。
             var leaks = LeaksSecret(ex, redaction);
             if (leaks)
-                _logger.Error("代理领取失败，Vendor={Vendor}，Phase=acquire，Elapsed={Elapsed}ms，原因={Reason}",
+                _logger.Warning("代理领取失败，Vendor={Vendor}，Phase=acquire，Elapsed={Elapsed}ms，原因={Reason}",
                     id, acquireMsFailed, Scrub(ex.Message, redaction));
             else
-                _logger.Error(ex, "代理领取失败，Vendor={Vendor}，Phase=acquire，Elapsed={Elapsed}ms", id, acquireMsFailed);
+                _logger.Warning(ex, "代理领取失败，Vendor={Vendor}，Phase=acquire，Elapsed={Elapsed}ms", id, acquireMsFailed);
             if (ex is ProxyServiceException)
                 throw new ProxyServiceException(id, "acquire", Scrub(ex.Message, redaction), leaks ? null : ex);
             throw new ProxyServiceException(id, "acquire", $"供应商 {id} 领取代理失败：{Scrub(ex.Message, redaction)}", leaks ? null : ex);
@@ -137,7 +146,7 @@ public sealed class ProxyService : IProxyService, IDisposable
         }
         catch (Exception ex)
         {
-            _logger.Error(ex, "IpInfo 查询失败，Vendor={Vendor}，Proxy={Proxy}，Phase=ipinfo，Elapsed={Elapsed}ms",
+            _logger.Warning(ex, "IpInfo 查询失败，Vendor={Vendor}，Proxy={Proxy}，Phase=ipinfo，Elapsed={Elapsed}ms",
                 id, endpoint.SafeAddress, (long)Stopwatch.GetElapsedTime(ipInfoStarted).TotalMilliseconds);
             if (ex is ProxyServiceException serviceException) throw;
             throw new ProxyServiceException(id, "ipinfo", $"通过代理 {endpoint.SafeAddress} 查询 IpInfo 失败：{ex.Message}", ex);
@@ -186,5 +195,5 @@ public sealed class ProxyService : IProxyService, IDisposable
             message = message.Replace(secret, "***", StringComparison.Ordinal);
         return message;
     }
-    public void Dispose() { foreach (var gate in _vendorGates.Values) gate.Dispose(); }
+    public void Dispose() { foreach (var gate in _vendorGates.Values) gate.Dispose(); _acquireGate.Dispose(); }
 }

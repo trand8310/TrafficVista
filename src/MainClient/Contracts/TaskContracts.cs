@@ -1,9 +1,14 @@
 using Newtonsoft.Json.Linq;
+using Newtonsoft.Json;
 
 namespace TrafficVista.Contracts;
 
-public sealed record TaskEnvelope(long Id, string Name, string Url, DateTime CreatedAt)
+public sealed record TaskEnvelope(long Id, string Name, string Url, DateTime CreatedAt) : IWorkerAssignedTask<TaskEnvelope>
 {
+    /// <summary>Assigned on dequeue, 1..WorkerCount; not persisted with pending tasks.</summary>
+    [JsonIgnore]
+    public int WorkerId { get; init; }
+    TaskEnvelope IWorkerAssignedTask<TaskEnvelope>.AssignWorker(int workerId) => this with { WorkerId = workerId };
     public JObject? Payload { get; init; }
     // The server ID may repeat; local durable claims identify a single delivery/copy instead.
     public string DeliveryId { get; init; } = Guid.NewGuid().ToString("N");

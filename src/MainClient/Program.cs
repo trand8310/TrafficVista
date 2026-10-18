@@ -7,6 +7,8 @@ namespace TrafficVista
 {
     internal static class Program
     {
+        internal static bool RestartRequested { get; set; }
+        internal static string? RestartResumeToken { get; set; }
         [STAThread]
         static int Main(string[] args)
         {
@@ -14,7 +16,8 @@ namespace TrafficVista
             GlobalExceptionHandling? exceptionHandling = null;
             var exitCode = 0;
             var interactive = !args.Any(arg => arg.StartsWith("--", StringComparison.Ordinal)
-                && !arg.Equals("--auto-start", StringComparison.OrdinalIgnoreCase));
+                && !arg.Equals("--auto-start", StringComparison.OrdinalIgnoreCase)
+                && !arg.StartsWith("--resume-restart=", StringComparison.Ordinal));
             try
             {
                 AppLogging.Configure(testMode: !interactive);
@@ -35,7 +38,7 @@ namespace TrafficVista
                     // 自检使用专用目录，不读写正式用户会话。
                     services = AppServices.Build(Log.Logger, interactive ? null :
                         Path.Combine(AppContext.BaseDirectory, "demo-output", "test-users"));
-                    // 在 UI 同步上下文创建之前完成初始化；整个容器只创建一个 IPlaywright。
+                    // Browser self-tests retain their own legacy manager; business drivers are created lazily.
                     if (args.Contains("--desktop-test"))
                     {
                         WriteTestResult("desktop-test.txt", DesktopIntegration.DesktopIntegrationTest.RunAsync().GetAwaiter().GetResult());
@@ -93,6 +96,10 @@ namespace TrafficVista
                     {
                         WriteTestResult("browser-close-test.txt", Business.ReliabilityIntegrationTest.RunBrowserCloseAsync(Log.Logger).GetAwaiter().GetResult());
                     }
+                    else if (args.Contains("--throughput-benchmark"))
+                    {
+                        WriteTestResult("throughput-benchmark.txt", Business.ReliabilityIntegrationTest.RunThroughputAsync(Log.Logger).GetAwaiter().GetResult());
+                    }
                     else if (args.Contains("--reliability-test") || args.Contains("--benchmark") || args.Contains("--business-test"))
                     {
                         // Fully offline, isolated fixtures, including device APIs and real local Chrome.
@@ -104,7 +111,7 @@ namespace TrafficVista
                     else if (args.Contains("--admission-test"))
                     {
                         WriteTestResult("admission-test.txt", Business.TaskAdmissionIntegrationTest.RunAsync(Log.Logger).GetAwaiter().GetResult());
-                        Log.Information("任务资源准入与 IP 优先投递验证通过");
+                        Log.Information("固定工作者、UV间隔投递与浏览器启动限制验证通过");
                     }
                     else if (args.Contains("--window-test"))
                     {
@@ -118,23 +125,26 @@ namespace TrafficVista
                     }
                     else
                     {
-                    services.GetRequiredService<IPlaywright>();
-                    var manager = services.GetRequiredService<ChromeInstanceManager>();
+                    ChromeInstanceManager? manager = null;
+                    if (args.Any(arg => arg is "--smoke-test" or "--touch-test" or "--isolation-test"
+                        or "--isolation-test-headed" or "--concurrency-test"))
+                        manager = services.GetRequiredService<ChromeInstanceManager>();
                     if (args.Contains("--smoke-test"))
-                        exitCode = RunSmokeTestAsync(manager).GetAwaiter().GetResult();
+                        exitCode = RunSmokeTestAsync(manager!).GetAwaiter().GetResult();
                     else if (args.Contains("--touch-test"))
-                        exitCode = RunIsolationTestAsync(manager, 1).GetAwaiter().GetResult();
+                        exitCode = RunIsolationTestAsync(manager!, 1).GetAwaiter().GetResult();
                     else if (args.Contains("--isolation-test"))
-                        exitCode = RunIsolationTestAsync(manager, 2).GetAwaiter().GetResult();
+                        exitCode = RunIsolationTestAsync(manager!, 2).GetAwaiter().GetResult();
                     else if (args.Contains("--isolation-test-headed"))
-                        exitCode = RunIsolationTestAsync(manager, 2, headless: false).GetAwaiter().GetResult();
+                        exitCode = RunIsolationTestAsync(manager!, 2, headless: false).GetAwaiter().GetResult();
                     else if (args.Contains("--concurrency-test"))
-                        exitCode = RunIsolationTestAsync(manager, 6).GetAwaiter().GetResult();
+                        exitCode = RunIsolationTestAsync(manager!, 6).GetAwaiter().GetResult();
                     else
                     {
                         ApplicationConfiguration.Initialize();
                         var form = services.GetRequiredService<MainForm>();
                         form.AutoStartRequested = args.Contains("--auto-start", StringComparer.OrdinalIgnoreCase);
+                        form.RestartResumeToken = args.SingleOrDefault(arg => arg.StartsWith("--resume-restart=", StringComparison.Ordinal))?[17..];
                         Application.Run(form);
                     }
                     }
@@ -163,8 +173,11 @@ namespace TrafficVista
                 {
                     try
                     {
+                        if (!Business.BrowserCloseCoordinator.Shared.DrainAsync(TimeSpan.FromSeconds(10)).GetAwaiter().GetResult())
+                            Log.Warning("退出前Playwright收尾仍在进行，即将释放共享驱动，Deferred={Deferred}", Business.BrowserCloseCoordinator.Shared.Snapshot.Deferred);
                         // 先关闭全部实例，再释放限流器和共享驱动；库方法不依赖 UI 同步上下文。
                         services.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                        Business.BrowserCloseCoordinator.Shared.DrainAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
                     }
                     catch (Exception ex)
                     {
@@ -180,6 +193,22 @@ namespace TrafficVista
                 {
                     exitCode = 1;
                     Trace.WriteLine(flushException);
+                }
+            }
+            if (RestartRequested && exitCode == 0)
+            {
+                try
+                {
+                    var launch = DesktopIntegration.StartupShortcutService.CurrentLaunch();
+                    if (RestartResumeToken is null) throw new InvalidOperationException("缺少定时重启队列恢复标识。");
+                    using var next = Process.Start(new ProcessStartInfo(launch.Executable, launch.Arguments + " --resume-restart=" + RestartResumeToken)
+                    { WorkingDirectory = launch.WorkingDirectory, UseShellExecute = true });
+                    if (next is null) throw new InvalidOperationException("无法启动下一轮应用。");
+                }
+                catch (Exception ex)
+                {
+                    exitCode = 1;
+                    MessageBox.Show("重启失败，暂存任务已保留，请重新打开程序并点击启动：" + ex.Message, "TrafficVista");
                 }
             }
             return exitCode;

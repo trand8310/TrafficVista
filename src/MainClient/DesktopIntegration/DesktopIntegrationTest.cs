@@ -52,7 +52,7 @@ internal static class DesktopIntegrationTest
         Check(MainForm.ApplicationState(SchedulerState.Stopped, false, false, false, false, false, false) == "应用：待启动", "初始待启动");
         Check(MainForm.ApplicationState(SchedulerState.Stopped, true, false, false, false, false) == "应用：启动中", "启动中");
         Check(MainForm.ApplicationState(SchedulerState.Running, false, false, true, false, false) == "应用：运行中", "运行中");
-        Check(MainForm.ApplicationState(SchedulerState.Running, false, false, true, true, false).Contains("等待资源"), "资源等待状态");
+        Check(MainForm.ApplicationState(SchedulerState.Running, false, false, true, true, false).Contains("等待任务"), "空队列等待任务状态");
         Check(MainForm.ApplicationState(SchedulerState.Running, true, false, true, false, false) == "应用：停止中", "停止中");
         Check(MainForm.ApplicationState(SchedulerState.Stopped, false, false, false, false, false) == "应用：已停止", "已停止");
         Check(MainForm.ApplicationState(SchedulerState.Faulted, false, false, false, false, false) == "应用：故障", "故障");

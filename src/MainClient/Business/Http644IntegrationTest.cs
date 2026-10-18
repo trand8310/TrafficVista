@@ -22,7 +22,7 @@ internal static class Http644IntegrationTest
         await VerifyProxyFailuresAsync(options with { SessionRoot = Path.Combine(root, "proxy-failures") }, logger, token);
         await VerifyNavigationAsync(options, logger, token);
         return "PASS\n连续3次644停止该任务剩余UV；1/2次不中断，成功/其他错误清零，普通错误文本不误判。\n"
-            + "等待名额和投递间隔可中断；已投UV继续完成，其他任务及相同ID的下一轮正常执行；未投数量和失败摘要准确，名额归零。\n"
+            + "投递间隔可中断；已投UV继续完成，其他任务及相同ID的下一轮正常执行；未投数量和失败摘要准确，会话归零。\n"
             + "明确代理错误/407在代理模式下一次即停止后续，普通超时/重置/DNS/502/504及直连不误停。真实Chrome验证644/407/200和本地失效代理，状态穿过清理异常后仍可识别；无公网/供应商请求。\n输出目录：" + root;
     }
 
@@ -30,7 +30,7 @@ internal static class Http644IntegrationTest
     {
         var runner = new ScriptRunner();
         using var consumer = new BrowserTaskConsumer(new Devices(), new NoProxy(), runner, options, logger);
-        consumer.Configure(new() { MaxConcurrency = 1, UvExecutionInterval = 0 });
+        consumer.Configure(new() { MaxConcurrency = 1, UvExecutionInterval = 100 });
         foreach (var (id, sequence, expected) in new[]
         {
             (1L, new[] { 644, 644, 644, 200, 200, 200 }, 3),
@@ -38,17 +38,22 @@ internal static class Http644IntegrationTest
             (3L, new[] { 644, 644, 502, 644, 644, 200 }, 6),
             (4L, new[] { 644, 644, 0, 644, 644, 200 }, 6),
             (5L, new[] { 644, 200 }, 2),
-            (6L, new[] { 644, 644 }, 2)
+            (6L, new[] { 644, 644 }, 2),
+            (7L, new[] { 200, 502, 502 }, 3),
+            (8L, new[] { 502, 502, 200 }, 3)
         })
         {
             runner.Script = (run, _) => Outcome(sequence[(int)run.UvId - 1]);
             var before = runner.Calls;
-            Check(!await consumer.ConsumeAsync(Task(id, sequence.Length), token), "failed UV makes task fail");
+            var expectedSuccess = sequence.Take(expected).Contains(200);
+            Check(await consumer.ConsumeAsync(Task(id, sequence.Length), token) == expectedSuccess, "any successful UV makes task succeed");
             Check(runner.Calls - before == expected, "exact dispatch count for sequence " + id);
             var summary = JObject.Parse(File.ReadAllText(Directory.EnumerateFiles(Path.Combine(options.SessionRoot, id.ToString()), "summary.json", SearchOption.AllDirectories).Single()));
             Check(summary.Value<int>("dispatchedUvs") == expected && summary.Value<int>("undispatchedUvs") == sequence.Length - expected, "summary counts " + id);
-            Check((summary.Value<string>("failure") == "consecutive-http-644") == (expected < sequence.Length), "summary reason " + id);
-            Check(consumer.ActiveUvCount == 0 && consumer.Admission.ReservedSlots == 0, "permits released " + id);
+            Check((summary.Value<string>("stopReason") == "consecutive-http-644") == (expected < sequence.Length), "summary stop reason " + id);
+            Check(summary.Value<bool>("success") == expectedSuccess
+                && (!expectedSuccess || summary["failure"]?.Type == JTokenType.Null), "summary agrees with any-UV success " + id);
+            Check(consumer.ActiveUvCount == 0 && consumer.Dispatch.ActiveTasks == 0, "permits released " + id);
         }
         runner.Script = (_, _) => System.Threading.Tasks.Task.FromResult(true);
         Check(await consumer.ConsumeAsync(Task(1, 2), token), "same task ID in a new run does not inherit the streak");
@@ -83,13 +88,12 @@ internal static class Http644IntegrationTest
         Check(!running.IsCompleted, "already-dispatched fourth UV is allowed to finish");
         Check(await consumer.ConsumeAsync(Task(11, 1), token), "another task can continue while stopped task drains");
         finishes[4].TrySetResult();
-        Check(!await running, "stopped task fails after in-flight UV completes");
-        Check(consumer.ActiveUvCount == 0 && consumer.Admission.ReservedSlots == 0 && consumer.Admission.PendingUvs == 0, "no stranded permits or pending UVs");
+        Check(await running, "stopped task succeeds when an in-flight UV succeeds");
+        Check(consumer.ActiveUvCount == 0 && consumer.Dispatch.ActiveTasks == 0 && consumer.Dispatch.PendingUvs == 0, "no stranded permits or pending UVs");
 
-        // Cancellation while the dispatcher is blocked on a UV permit must not cancel an active UV.
+        // Stopping a cadence wait must not cancel an already active UV.
         using var guard = new UvDispatchGuard(token);
-        using var permit = new SemaphoreSlim(0, 1);
-        var waiting = permit.WaitAsync(guard.Token);
+        var waiting = System.Threading.Tasks.Task.Delay(Timeout.InfiniteTimeSpan, guard.Token);
         for (var i = 0; i < 3; i++) guard.Record(false, new AggregateException(new PageHttpStatusException(644, "http://test/")), false);
         try { await waiting; throw new InvalidOperationException("dispatch wait did not cancel"); }
         catch (OperationCanceledException) when (guard.Stopped && !token.IsCancellationRequested) { }
@@ -99,7 +103,7 @@ internal static class Http644IntegrationTest
     {
         var runner = new ScriptRunner();
         using var consumer = new BrowserTaskConsumer(new Devices(), new LocalProxy("127.0.0.1:1"), runner, options, logger);
-        consumer.Configure(new() { MaxConcurrency = 1, UvExecutionInterval = 0, IsProxyMode = true });
+        consumer.Configure(new() { MaxConcurrency = 1, UvExecutionInterval = 100, IsProxyMode = true });
         long id = 100;
         foreach (var code in ProxyUnavailableException.BrowserCodes.Append("HTTP407"))
         {
@@ -125,13 +129,13 @@ internal static class Http644IntegrationTest
             Check(!await consumer.ConsumeAsync(Task(id++, 2), token) && runner.Calls - before == 2, "gateway status alone continues");
         }
         using var direct = new BrowserTaskConsumer(new Devices(), new NoProxy(), runner, options with { SessionRoot = options.SessionRoot + "-direct" }, logger);
-        direct.Configure(new() { MaxConcurrency = 1, UvExecutionInterval = 0 });
+        direct.Configure(new() { MaxConcurrency = 1, UvExecutionInterval = 100 });
         runner.Script = (_, _) => System.Threading.Tasks.Task.FromException<bool>(new ProxyUnavailableException("ERR_PROXY_CONNECTION_FAILED", new Exception("fixture")));
         var directBefore = runner.Calls;
         Check(!await direct.ConsumeAsync(Task(id++, 2), token) && runner.Calls - directBefore == 2, "direct mode never trips proxy stop rule");
         runner.Script = (_, _) => System.Threading.Tasks.Task.FromResult(true);
         Check(await consumer.ConsumeAsync(Task(id++, 2), token), "next task gets a fresh guard");
-        Check(consumer.Admission.ReservedSlots == 0 && direct.Admission.ReservedSlots == 0, "proxy stop releases permits");
+        Check(consumer.Dispatch.ActiveTasks == 0 && direct.Dispatch.ActiveTasks == 0, "proxy stop releases permits");
     }
 
     private static async Task VerifyNavigationAsync(BusinessOptions options, ILogger logger, CancellationToken token)
@@ -161,12 +165,12 @@ internal static class Http644IntegrationTest
         using var cache = new SharedStaticResourceCache(actual, logger);
         var runner = new BusinessUvBrowserRunner(playwright, launches, cache, logger, business: actual);
         using var consumer = new BrowserTaskConsumer(new Devices(), new LocalProxy("127.0.0.1:" + port), runner, actual, logger);
-        consumer.Configure(new() { MaxConcurrency = 1, UvExecutionInterval = 0, IsProxyMode = true, IsHiddenMode = true, PageLoadingTimeout = 10 });
+        consumer.Configure(new() { MaxConcurrency = 1, UvExecutionInterval = 30000, IsProxyMode = true, IsHiddenMode = true, PageLoadingTimeout = 10 });
         Check(!await consumer.ConsumeAsync(Task(999, 5), token), "real refused proxy fails");
         var summary = JObject.Parse(File.ReadAllText(Directory.EnumerateFiles(Path.Combine(actual.SessionRoot, "999"), "summary.json", SearchOption.AllDirectories).Single()));
         Check(summary.Value<int>("dispatchedUvs") == 1 && summary.Value<int>("undispatchedUvs") == 4
             && summary.Value<string>("failure")!.StartsWith("proxy-unavailable:ERR_PROXY_CONNECTION_FAILED"), "real browser error survives aggregate cleanup and stops next UV");
-        Check(consumer.ActiveUvCount == 0 && consumer.Admission.ReservedSlots == 0 && ChromeProcessJob.OwnedProcessCount == 0, "real proxy failure cleans browsers and permits");
+        Check(consumer.ActiveUvCount == 0 && consumer.Dispatch.ActiveTasks == 0 && ChromeProcessJob.OwnedProcessCount == 0, "real proxy failure cleans browsers and permits");
     }
 
     private static TaskCompletionSource Signal() => new(TaskCreationOptions.RunContinuationsAsynchronously);

@@ -52,9 +52,11 @@ internal static class InitialPageNavigation
             {
                 token.ThrowIfCancellationRequested();
                 var remaining = budget - Stopwatch.GetElapsedTime(started);
-                // 导航超时后仍做一次最多2秒的检查，以接纳已提交的慢页面。
-                // 独立检查上限不随渲染等待的最后几十毫秒缩短，否则会把正常控制通道响应误判超时。
-                var state = await PageContentInspector.InspectAsync(page, TimeSpan.FromSeconds(2), token).ConfigureAwait(false);
+                // Use the remaining navigation budget for the control-channel round trip. A busy
+                // driver is not a failed URL merely because it takes more than two seconds to reply.
+                // Preserve the existing final two-second check for an already committed slow document.
+                var inspectionBudget = remaining > TimeSpan.FromSeconds(2) ? remaining : TimeSpan.FromSeconds(2);
+                var state = await PageContentInspector.InspectAsync(page, inspectionBudget, token).ConfigureAwait(false);
                 if (document?.Status == 644) throw new PageHttpStatusException(644, document.Url);
                 if (document?.Status == 407) throw new PageHttpStatusException(407, document.Url);
                 if (!string.IsNullOrWhiteSpace(networkFailure))

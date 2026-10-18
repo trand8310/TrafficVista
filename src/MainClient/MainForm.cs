@@ -26,8 +26,12 @@ public partial class MainForm : Form
     private string? _operationError;
     private string? _transitionText;
     internal bool AutoStartRequested { get; set; }
+    internal string? RestartResumeToken { get; set; }
     private bool _autoStartHandled;
     private SchedulingDiagnosticsForm? _diagnosticsForm;
+    private long _restartStarted;
+    private int _restartMinutes;
+    private bool _restartInProgress;
     internal DesktopStatusSnapshot DesktopStatus => _desktopMonitor.Snapshot;
 
     public MainForm(ILogger logger, TaskSchedulingService scheduler, TrafficVistaSettings settings)
@@ -36,6 +40,9 @@ public partial class MainForm : Form
         _scheduler = scheduler;
         _settings = settings;
         InitializeComponent();
+        this.Text = $"{AppConsts.AppName}(v{AppConsts.AppVersion})";
+
+
         _desktopMonitor = new DesktopStatusMonitor();
         _startupShortcut = new StartupShortcutService();
         Disposed += (_, _) => _desktopMonitor.Dispose();
@@ -61,14 +68,19 @@ public partial class MainForm : Form
         label_Status.ContextMenuStrip = diagnosticsMenu;
         _statusToolTip.SetToolTip(checkBox_RealIp, "代理模式优先使用供应商真实出口IP，缺失时查询；直连模式查询本机出口IP，并传给浏览器环境。");
         _statusToolTip.SetToolTip(checkBox_IpDetails, "通过当前网络通道竞速查询完整IP详情，并设置有效时区和定位；代理查询全部失败则换新IP，直连查询失败则记日志并结束本任务。");
-        _statusToolTip.SetToolTip(numericUpDown_TaskWorkers, "任务工作协程数量；多任务共用设定的UV并发池，每项任务按自己的UV间隔投递。Worker等待时不占浏览器。");
+        _statusToolTip.SetToolTip(numericUpDown_MaxConcurrency, "同时处理的任务数量；每个工作者串行消费任务，各任务独立按UV间隔投递，全部UV结束并清理后再取下一项。");
         _statusToolTip.SetToolTip(checkBox_IsHiddenMode, "启动或运行中可修改；后续开始执行的任务使用最新模式，当前任务及其剩余UV保持原模式。");
+        _statusToolTip.SetToolTip(checkBox_TaskIntakeBackpressure, "勾选：按启动需求高低水位暂停/恢复领取任务。取消：不因启动需求暂停领取。运行中立即生效，自动保存；浏览器启动并发限制仍生效。");
+        _statusToolTip.SetToolTip(numericUpDown_AutoRestartMinutes, "0关闭；正数为本轮运行多少分钟后准备重启。先暂停取任务、暂存队列，等待已领取任务及浏览器收尾完成再重启，自动恢复队列并继续工作。下次启动生效。");
+        _statusToolTip.SetToolTip(comboBox_JavaScriptCacheMode, "不缓存：脚本跳过已有缓存并且不写入；URL：完整URL独立保存；URL＋内容：GET且文件名以.js结尾时按正文去重，新URL仍需首次下载。本轮启动后固定。");
+        _statusToolTip.SetToolTip(textBox_CacheExcludedUrlPrefixes, "仅针对JS：每行一个完整HTTP/HTTPS URL前缀，例如 https://hm.baidu.com/。匹配的脚本不读写缓存，正常发送网络请求；CSS、图片等仍按原规则缓存。域名不区分大小写，路径及查询区分大小写，不支持通配符。");
         ApplyUiSettings(settings.Value);
         foreach (var control in ConfigurationControls)
         {
             if (control is TextBox text) text.TextChanged += UiSettingsChanged;
             else if (control is NumericUpDown number) number.ValueChanged += UiSettingsChanged;
             else if (control is CheckBox check) check.CheckedChanged += UiSettingsChanged;
+            else if (control is ComboBox combo) combo.SelectedIndexChanged += UiSettingsChanged;
         }
         saveSettingsTimer.Tick += (_, _) =>
         {
@@ -76,7 +88,7 @@ public partial class MainForm : Form
             try { SaveUiSettings(); }
             catch (Exception ex) { _operationError = ex.Message; _logger.Error(ex, "保存界面配置失败"); label_Status.Text = $"配置保存失败：{ex.Message}"; }
         };
-        refreshTimer.Tick += (_, _) => RefreshSchedulingUi();
+        refreshTimer.Tick += async (_, _) => { RefreshSchedulingUi(); await CheckScheduledRestartAsync(); };
         refreshTimer.Start();
         FormClosing += MainForm_FormClosing;
         SetBusy(false);
@@ -87,10 +99,11 @@ public partial class MainForm : Form
     [
         textBox_TaskApiUrl, textBox_ProxyIpUrl, textBox_DevApiUrl, textBox_TaskName,
         numericUpDown_TaskFetchInterval, numericUpDown_UvExecutionInterval,
-        numericUpDown_MaxConcurrency, numericUpDown_TaskWorkers, textBox_PageLoadingDelay, numericUpDown_PageLoadingTimeout,
+        numericUpDown_MaxConcurrency, numericUpDown_PlaywrightDriverCount, numericUpDown_AutoRestartMinutes, textBox_PageLoadingDelay, numericUpDown_PageLoadingTimeout,
         numericUpDown_Multiple, numericUpDown_IpTtl, numericUpDown_AcquireRetry,
         checkBox_IsHiddenMode,
-        checkBox_IsProxyMode, checkBox_IsCacheMode, checkBox_VerboseLog, checkBox_RealIp, checkBox_IpDetails
+        checkBox_IsProxyMode, checkBox_IsCacheMode, comboBox_JavaScriptCacheMode, textBox_CacheExcludedUrlPrefixes,
+        checkBox_VerboseLog, checkBox_RealIp, checkBox_IpDetails, checkBox_TaskIntakeBackpressure
     ];
 
     internal void ApplyUiSettings(TrafficVistaOptions options)
@@ -103,7 +116,8 @@ public partial class MainForm : Form
         numericUpDown_TaskFetchInterval.Value = options.TaskFetchInterval;
         numericUpDown_UvExecutionInterval.Value = options.UvExecutionInterval;
         numericUpDown_MaxConcurrency.Value = options.MaxConcurrency;
-        numericUpDown_TaskWorkers.Value = options.TaskWorkerCount;
+        numericUpDown_PlaywrightDriverCount.Value = options.PlaywrightDriverCount;
+        numericUpDown_AutoRestartMinutes.Value = options.AutoRestartMinutes;
         textBox_PageLoadingDelay.Text = options.PageLoadingDelay.ToString(CultureInfo.CurrentCulture);
         numericUpDown_PageLoadingTimeout.Value = options.PageLoadingTimeout;
         numericUpDown_Multiple.Value = options.Multiple;
@@ -112,11 +126,15 @@ public partial class MainForm : Form
         numericUpDown_AcquireRetry.Value = Math.Clamp(_settings.Net.AcquireRetryCount,
             (int)numericUpDown_AcquireRetry.Minimum, (int)numericUpDown_AcquireRetry.Maximum);
         checkBox_IsHiddenMode.Checked = options.IsHiddenMode;
+        checkBox_TaskIntakeBackpressure.Checked = options.TaskIntakeBackpressureEnabled;
         checkBox_IsProxyMode.Checked = options.IsProxyMode;
         checkBox_RealIp.Checked = options.ResolveRealIp;
         checkBox_IpDetails.Checked = options.FetchIpDetails;
         checkBox_IsCacheMode.Checked = options.IsCacheMode;
+        comboBox_JavaScriptCacheMode.SelectedIndex = (int)options.JavaScriptCacheMode - 1;
+        textBox_CacheExcludedUrlPrefixes.Text = options.CacheExcludedUrlPrefixes;
         checkBox_VerboseLog.Checked = options.VerboseLog;
+        RefreshCacheSettingsAvailability();
         AppLogging.SetVerbose(options.VerboseLog);
     }
 
@@ -135,26 +153,33 @@ public partial class MainForm : Form
             TaskFetchInterval = (int)numericUpDown_TaskFetchInterval.Value,
             UvExecutionInterval = (int)numericUpDown_UvExecutionInterval.Value,
             MaxConcurrency = (int)numericUpDown_MaxConcurrency.Value,
-            TaskWorkerCount = (int)numericUpDown_TaskWorkers.Value,
+            PlaywrightDriverCount = (int)numericUpDown_PlaywrightDriverCount.Value,
+            AutoRestartMinutes = (int)numericUpDown_AutoRestartMinutes.Value,
             PageLoadingDelay = delay,
             PageLoadingTimeout = (int)numericUpDown_PageLoadingTimeout.Value,
             Multiple = (int)numericUpDown_Multiple.Value,
             IpTtl = (int)numericUpDown_IpTtl.Value,
             IsHiddenMode = checkBox_IsHiddenMode.Checked,
+            TaskIntakeBackpressureEnabled = checkBox_TaskIntakeBackpressure.Checked,
             IsProxyMode = checkBox_IsProxyMode.Checked,
             ResolveRealIp = checkBox_RealIp.Checked,
             FetchIpDetails = checkBox_IpDetails.Checked,
             IsCacheMode = checkBox_IsCacheMode.Checked,
+            JavaScriptCacheMode = (JavaScriptCacheMode)(comboBox_JavaScriptCacheMode.SelectedIndex + 1),
+            CacheExcludedUrlPrefixes = textBox_CacheExcludedUrlPrefixes.Text,
             VerboseLog = checkBox_VerboseLog.Checked
         };
     }
 
     private void UiSettingsChanged(object? sender, EventArgs e)
     {
+        RefreshCacheSettingsAvailability();
         _settingsDirty = true;
         saveSettingsTimer.Stop();
         saveSettingsTimer.Start();
         AppLogging.SetVerbose(checkBox_VerboseLog.Checked);
+        if (ReferenceEquals(sender, checkBox_TaskIntakeBackpressure))
+            _scheduler.UpdateTaskIntakeBackpressure(checkBox_TaskIntakeBackpressure.Checked);
         if (ReferenceEquals(sender, checkBox_IsHiddenMode))
         {
             _scheduler.UpdateHiddenMode(checkBox_IsHiddenMode.Checked);
@@ -178,7 +203,9 @@ public partial class MainForm : Form
         btnStartStop.Enabled = !busy && !_closing;
         foreach (var control in ConfigurationControls)
         {
-            if (control is TextBox text)
+            if (ReferenceEquals(control, numericUpDown_AutoRestartMinutes))
+                control.Enabled = !busy && !_closing && !_scheduler.IsRunning;
+            else if (control is TextBox text)
             {
                 text.ReadOnly = !(!busy && !_closing && !_scheduler.IsRunning);
             }
@@ -186,13 +213,21 @@ public partial class MainForm : Form
             {
                 number.ReadOnly = !(!busy && !_closing && !_scheduler.IsRunning);
             }
-            else if (ReferenceEquals(control, checkBox_IsHiddenMode))
+            else if (ReferenceEquals(control, checkBox_IsHiddenMode) || ReferenceEquals(control, checkBox_TaskIntakeBackpressure))
                 control.Enabled = !_closing;
             else
                 control.Enabled = !busy && !_closing && !_scheduler.IsRunning;
         }
         btnStartStop.Text = _scheduler.IsRunning ? "停止" : "启动";
+        RefreshCacheSettingsAvailability();
         RefreshApplicationState();
+    }
+
+    private void RefreshCacheSettingsAvailability()
+    {
+        var editable = checkBox_IsCacheMode.Checked && !_busy && !_closing && !_scheduler.IsRunning;
+        comboBox_JavaScriptCacheMode.Enabled = editable;
+        textBox_CacheExcludedUrlPrefixes.Enabled = editable;
     }
 
     private async void btnStartStop_Click(object sender, EventArgs e)
@@ -209,7 +244,11 @@ public partial class MainForm : Form
                 var options = ReadUiSettings();
                 options.Validate();
                 SaveUiSettings();
-                await _scheduler.StartAsync(options, _settings.CreateSchedulerOptions(options));
+                var schedulerOptions = _settings.CreateSchedulerOptions(options, RestartResumeToken);
+                RestartResumeToken = null;
+                await _scheduler.StartAsync(options, schedulerOptions);
+                _restartStarted = Stopwatch.GetTimestamp();
+                _restartMinutes = options.AutoRestartMinutes;
                 _schedulerObservation = ObserveSchedulerAsync(_scheduler.Completion);
             }
             RefreshSchedulingUi();
@@ -230,25 +269,60 @@ public partial class MainForm : Form
         catch (Exception ex) { _logger.Error(ex, "观察调度结束失败"); }
     }
 
+    private async Task CheckScheduledRestartAsync()
+    {
+        if (_restartInProgress || _busy || _closing || !_scheduler.IsRunning || _restartMinutes == 0
+            || Stopwatch.GetElapsedTime(_restartStarted) < TimeSpan.FromMinutes(_restartMinutes)) return;
+        _restartInProgress = true;
+        _transitionText = "应用：暂存队列，等待在途任务完成后重启";
+        SetBusy(true);
+        try
+        {
+            SaveUiSettings();
+            Program.RestartResumeToken = await _scheduler.PrepareRestartAsync();
+            if (_schedulerObservation is not null) await _schedulerObservation;
+            Program.RestartRequested = true;
+            _allowClose = true;
+            Close();
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(ex, "定时重启未完成，保留应用及暂存任务供检查");
+            _operationError = "定时重启失败：" + ex.Message;
+            _restartMinutes = 0;
+        }
+        finally
+        {
+            if (!_allowClose) { _transitionText = null; _restartInProgress = false; SetBusy(false); }
+        }
+    }
+
     private void RefreshSchedulingUi()
     {
         RefreshStatusBar();
         if (_schedulerObservation is null) return;
         var s = _scheduler.Snapshot;
         var p = _scheduler.Performance;
-        var admission = _scheduler.Admission;
+        var dispatch = _scheduler.Dispatch;
         var currentError = s.CacheError ?? s.LastError;
-        label_Status.Text = BuildTaskStatusText(s, p, _scheduler.ActiveUvSessions, admission, currentError);
-        var pressureDetails = admission is null ? "" : $"CPU趋势：{admission.CpuPercent:F1}%，可用物理内存：{admission.AvailableMemoryMiB:F0} MiB，新任务内存名额：{admission.MemoryCapacity}";
-        _statusToolTip.SetToolTip(label_Status, "双击或右键查看累计统计、当前阶段及等待时长。\n" + pressureDetails + (currentError is null ? "" : "\n" + currentError));
+        label_Status.Text = BuildTaskStatusText(s, p, _scheduler.ActiveUvSessions, dispatch, currentError);
+        if (_restartInProgress) label_Status.Text = "定时重启：已暂停取任务，等待在途任务完成及队列落盘\n" + label_Status.Text;
+        else if (_scheduler.IsRunning && _restartMinutes > 0)
+            label_Status.Text = $"定时重启：约{Math.Max(0, _restartMinutes - Stopwatch.GetElapsedTime(_restartStarted).TotalMinutes):F1}分钟后开始收尾\n" + label_Status.Text;
+        var dispatchDetails = dispatch is null ? "" : $"按任务UV间隔投递；待投递UV：{dispatch.PendingUvs}，执行中任务：{dispatch.ActiveTasks}";
+        _statusToolTip.SetToolTip(label_Status, "双击或右键查看累计统计、当前阶段及等待时长。\n" + dispatchDetails + (currentError is null ? "" : "\n" + currentError));
         SetBusy(_busy);
     }
 
     internal static string BuildTaskStatusText(SchedulerSnapshot s, BusinessMetricsSnapshot p, int active,
-        TaskAdmissionSnapshot? admission, string? error)
+        TaskDispatchSnapshot? dispatch, string? error)
     {
         static string Short(string value, int length) => value.Length <= length ? value : value[..length] + "…";
-        var text = $"UV投递 / 分（最近60秒）：{p.DispatchesPerMinute:F0}"
+        var text = $"运行时间：{p.RunElapsedText}"
+            + $"\n提交数量（UV开始运行）：{p.DispatchedUvs}"
+            + $"\n执行数量（浏览器开始启动）：{p.BrowserStartAttempts}"
+            + $"\n曝光数量（首次页面打开成功）：{p.ExposedUvs}"
+            + $"\nUV投递 / 分（最近60秒）：{p.DispatchesPerMinute:F0}"
             + $"\nUV完成 / 分（本轮平均）：{p.AttemptsPerMinute:F1}"
             + $"\nUV成功 / 分（本轮平均）：{p.UvsPerMinute:F1}"
             + $"\nUV耗时 P95：{p.UvP95Ms / 1000:F1}秒"
@@ -266,10 +340,8 @@ public partial class MainForm : Form
             + $"\n任务失败：{s.Failed}"
             + $"\n任务取消：{s.Canceled}"
             + $"\n任务待恢复：{s.Cached}";
-        if (admission is not null) text += $"\n取任务：{Short(admission.Reason, 16)}"
-            + $"\nUV名额占用：{admission.ReservedSlots}"
-            + $"\n等待名额的任务：{admission.WaitingTasks}"
-            + $"\n待投递UV：{admission.PendingUvs}";
+        if (dispatch is not null) text += $"\n待投递UV：{dispatch.PendingUvs}"
+            + $"\n执行中任务：{dispatch.ActiveTasks}";
         var slow = p.ActiveStages.OrderByDescending(item => item.Value.OldestSeconds).FirstOrDefault();
         if (slow.Key is not null) text += $"\n最慢阶段：{Short(slow.Key, 12)}"
             + $"\n该阶段数量：{slow.Value.Count}"
@@ -313,14 +385,14 @@ public partial class MainForm : Form
     }
 
     internal static string ApplicationState(SchedulerState state, bool busy, bool closing, bool running,
-        bool resourceWait, bool hasError, bool hasStarted = true)
+        bool waitingForTasks, bool hasError, bool hasStarted = true)
     {
         if (closing || state == SchedulerState.Stopping) return "应用：停止中";
         if (hasError || state == SchedulerState.Faulted) return "应用：故障";
         if (busy) return running ? "应用：停止中" : "应用：启动中";
         return state switch
         {
-            SchedulerState.Running => resourceWait ? "应用：运行中（等待资源）" : "应用：运行中",
+            SchedulerState.Running => waitingForTasks ? "应用：运行中（等待任务）" : "应用：运行中",
             SchedulerState.Stopped => hasStarted ? "应用：已停止" : "应用：待启动",
             SchedulerState.Disposed => "应用：已停止",
             _ => "应用：待启动"
@@ -331,11 +403,10 @@ public partial class MainForm : Form
     {
         if (IsDisposed) return;
         var snapshot = _scheduler.Snapshot;
-        var admission = _scheduler.Admission;
-        var waiting = admission is { MemoryCapacity: 0 } || (admission?.Reason is { } reason && (reason.Contains("承压") || reason.Contains("采样")));
+        var waiting = snapshot.Queued == 0 && snapshot.Running == 0 && snapshot.Preparing == 0;
         toolStripStatusLabel1.Text = _busy && !_closing && _transitionText is not null ? _transitionText
             : ApplicationState(snapshot.State, _busy, _closing, _scheduler.IsRunning, waiting, _operationError is not null, _schedulerObservation is not null);
-        toolStripStatusLabel1.ToolTipText = _operationError ?? $"任务Worker：{snapshot.Workers}；{admission?.Reason ?? "等待启动任务"}";
+        toolStripStatusLabel1.ToolTipText = _operationError ?? $"任务Worker：{snapshot.Workers}；按任务UV间隔投递";
     }
 
     internal void RefreshStatusBar()
@@ -415,5 +486,15 @@ public partial class MainForm : Form
     {
         try { await Task.Run(() => Process.Start(new ProcessStartInfo(AppContext.BaseDirectory) { UseShellExecute = true, Verb = "open" })?.Dispose()); }
         catch (Exception ex) { _logger.Error(ex, "打开应用目录失败"); if (!IsDisposed) label_Status.Text = "打开应用目录失败：" + ex.Message; }
+    }
+
+    private void panel1_Paint(object sender, PaintEventArgs e)
+    {
+
+    }
+
+    private void MainForm_Load(object sender, EventArgs e)
+    {
+
     }
 }

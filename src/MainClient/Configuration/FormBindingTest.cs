@@ -17,8 +17,9 @@ internal static class FormBindingTest
         var expected = settings.Value with
         {
             TaskName = "界面绑定测试", TaskFetchInterval = 250, UvExecutionInterval = 500,
-            MaxConcurrency = 8, TaskWorkerCount = 50, PageLoadingDelay = 0.5m, PageLoadingTimeout = 30,
-            Multiple = 2, IpTtl = 60, IsHiddenMode = true, IsProxyMode = true, IsCacheMode = true, VerboseLog = true,
+            MaxConcurrency = 50, PlaywrightDriverCount = 4, PageLoadingDelay = 0.5m, PageLoadingTimeout = 30,
+            Multiple = 2, IpTtl = 60, IsHiddenMode = true, IsProxyMode = true, IsCacheMode = true, JavaScriptCacheMode = JavaScriptCacheMode.Url,
+            CacheExcludedUrlPrefixes = "https://hm.baidu.com/\r\nhttps://example.com/track", VerboseLog = true,
             ResolveRealIp = false, FetchIpDetails = true
         };
         settings.Save(expected);
@@ -29,19 +30,41 @@ internal static class FormBindingTest
         {
             using var form = new MainForm(logger, scheduler, settings);
             if (form.ReadUiSettings() != expected) throw new InvalidOperationException("界面恢复与配置不一致。");
+            var cacheEnabled = (CheckBox)form.Controls.Find("checkBox_IsCacheMode", true).Single();
+            var jsMode = (ComboBox)form.Controls.Find("comboBox_JavaScriptCacheMode", true).Single();
+            var exclusions = (TextBox)form.Controls.Find("textBox_CacheExcludedUrlPrefixes", true).Single();
+            if (cacheEnabled.Parent?.Name != "groupBox_Cache" || jsMode.Parent != cacheEnabled.Parent || !jsMode.Enabled || jsMode.SelectedIndex != 1
+                || exclusions.Text != expected.CacheExcludedUrlPrefixes)
+                throw new InvalidOperationException("缓存独立分组或JS模式及排除列表恢复失败。");
+            jsMode.SelectedIndex = 0;
+            exclusions.Text = "https://hm.baidu.com/";
             ((TextBox)form.Controls.Find("textBox_TaskName", true).Single()).Text = "修改后的任务名称";
-            ((NumericUpDown)form.Controls.Find("numericUpDown_MaxConcurrency", true).Single()).Value = 12;
-            ((NumericUpDown)form.Controls.Find("numericUpDown_TaskWorkers", true).Single()).Value = 96;
+            ((NumericUpDown)form.Controls.Find("numericUpDown_MaxConcurrency", true).Single()).Value = 96;
+            var driverControl = (NumericUpDown)form.Controls.Find("numericUpDown_PlaywrightDriverCount", true).Single();
+            if (driverControl.Value != 4 || driverControl.Minimum != 0 || driverControl.Maximum != 1024)
+                throw new InvalidOperationException("Playwright驱动数恢复或边界失败。");
+            driverControl.Value = 0;
+            var backpressure = (CheckBox)form.Controls.Find("checkBox_TaskIntakeBackpressure", true).Single();
+            if (!backpressure.Checked) throw new InvalidOperationException("背压开关默认开启未恢复。");
+            backpressure.Checked = false;
+            var restart = (NumericUpDown)form.Controls.Find("numericUpDown_AutoRestartMinutes", true).Single();
+            if (restart.Value != 0 || restart.Minimum != 0 || restart.Maximum != 10080)
+                throw new InvalidOperationException("定时重启默认值或分钟范围错误。");
+            restart.Value = 60;
+            if (form.Controls.Find("numericUpDown_TaskWorkers", true).Length != 0)
+                throw new InvalidOperationException("界面仍存在第二个并发输入框。");
             ((CheckBox)form.Controls.Find("checkBox_IsHiddenMode", true).Single()).Checked = false;
             ((CheckBox)form.Controls.Find("checkBox_IsCacheMode", true).Single()).Checked = false;
+            if (jsMode.Enabled || exclusions.Enabled) throw new InvalidOperationException("关闭缓存后JS缓存设置仍可编辑。");
             ((CheckBox)form.Controls.Find("checkBox_RealIp", true).Single()).Checked = true;
             ((CheckBox)form.Controls.Find("checkBox_IpDetails", true).Single()).Checked = false;
             form.SaveUiSettings();
-            var updated = expected with { TaskName = "修改后的任务名称", MaxConcurrency = 12, TaskWorkerCount = 96, IsHiddenMode = false, IsCacheMode = false,
-                ResolveRealIp = true, FetchIpDetails = false };
+            var updated = expected with { TaskName = "修改后的任务名称", MaxConcurrency = 96, PlaywrightDriverCount = 0, IsHiddenMode = false, IsCacheMode = false,
+                ResolveRealIp = true, FetchIpDetails = false, TaskIntakeBackpressureEnabled = false, AutoRestartMinutes = 60, JavaScriptCacheMode = JavaScriptCacheMode.Disabled,
+                CacheExcludedUrlPrefixes = "https://hm.baidu.com/" };
             if (new TrafficVistaSettings(directory).Value != updated) throw new InvalidOperationException("界面事件或保存绑定失败。");
             if (settings.CreateSchedulerOptions(updated).WorkerCount != 96)
-                throw new InvalidOperationException("界面Worker数没有作用于调度器。");
+                throw new InvalidOperationException("界面任务并发数没有作用于调度器。");
             if (form.Controls.Find("_firstUserId", true).Length != 0 || form.Controls.Find("_instanceCount", true).Length != 0
                 || form.Controls.Find("btnStartStop", true).Single().Parent?.Name != "panel1")
                 throw new InvalidOperationException("旧动态控件或按钮布局仍在干扰设计器。");
@@ -62,6 +85,8 @@ internal static class FormBindingTest
             form.Show();
             form.PerformLayout();
             Application.DoEvents();
+            if (form.Controls.Find("label_PlaywrightDriverCount", true).Single().Right > driverControl.Left)
+                throw new InvalidOperationException("Playwright驱动数标签遮挡输入框。");
             var liveLogs = (UiLogging.LiveLogView)form.Controls.Find("liveLogView", true).Single();
             var marker = "MainForm实时日志接线验证 " + Guid.NewGuid().ToString("N");
             logger.Information("{Marker}", marker);
@@ -83,11 +108,12 @@ internal static class FormBindingTest
             if (!texts[0].Contains("待启动") || !texts[1].Contains("逻辑核") || !texts[1].Contains('%')
                 || !texts[2].Contains("GB") || !texts[3].Contains("浏览器进程：0"))
                 throw new InvalidOperationException("四个状态栏指标未接入或采样失败。");
-            if (liveLogs.Bottom > strip.Top) throw new InvalidOperationException("日志区域遮挡状态栏。");
+            if (liveLogs.Visible && liveLogs.RectangleToScreen(liveLogs.ClientRectangle).IntersectsWith(strip.RectangleToScreen(strip.ClientRectangle)))
+                throw new InvalidOperationException("日志区域遮挡状态栏。");
             status.Text = MainForm.BuildTaskStatusText(new() { State = SchedulerState.Running, Submitted = 12345,
                 Queued = 128, Running = 4, Completed = 12001, Failed = 1, Cached = 128 },
                 new Business.BusinessMetricsSnapshot(12345, 12, 0, 4, 4, 34.4, 4000, 8600, 0, 0, new()), 8,
-                new(8, 4, 9999, 1, 4, 60, 4096, "优先投递已领 IP 的剩余 UV"), "测试页面超时。悬停查看详细异常。");
+                new(9999, 4), "测试页面超时。悬停查看详细异常。");
             var measuredStatus = TextRenderer.MeasureText(status.Text, status.Font,
                 new Size(status.ClientSize.Width - status.Padding.Horizontal, int.MaxValue), TextFormatFlags.WordBreak);
             if (measuredStatus.Height > status.ClientSize.Height - status.Padding.Vertical)
@@ -95,6 +121,7 @@ internal static class FormBindingTest
             using var bitmap = new Bitmap(form.Width, form.Height);
             form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size));
             bitmap.Save(Path.Combine(AppContext.BaseDirectory, "demo-output", "mainform-preview.png"));
+            DpiScalingTest.Verify(form);
             form.Hide();
             if (scheduler.IsRunning) throw new InvalidOperationException("普通启动不应自动开始任务。");
             using (var automatic = new MainForm(logger, scheduler, settings) { AutoStartRequested = true, ShowInTaskbar = false, Opacity = 0 })
@@ -120,10 +147,34 @@ internal static class FormBindingTest
                 Application.DoEvents();
                 if (scheduler.IsRunning) throw new InvalidOperationException("窗体再次显示不应重复自动启动。");
             }
-            return "PASS\n设计器控件恢复、文本/数值/开关事件保存、Worker/IP重试双向绑定、实时日志、四项状态栏后台采样、摘要及布局渲染通过；自动启动按钮接线及仅触发一次通过。任务HTTP全部使用空列表桩，无浏览器启动、无真实接口请求、未创建真实开机启动快捷方式。";
+            using (var restarting = new MainForm(logger, scheduler, settings) { AutoStartRequested = true, ShowInTaskbar = false, Opacity = 0 })
+            {
+                restarting.Show();
+                var wait = System.Diagnostics.Stopwatch.StartNew();
+                while (!scheduler.IsRunning && wait.Elapsed < TimeSpan.FromSeconds(5))
+                { Application.DoEvents(); Thread.Sleep(10); }
+                if (!scheduler.IsRunning) throw new InvalidOperationException("重启后的自动启动未生效。");
+                if (restarting.Controls.Find("numericUpDown_AutoRestartMinutes", true).Single().Enabled)
+                    throw new InvalidOperationException("运行中不能修改本轮重启时间导致暂存配置丢失。");
+                typeof(MainForm).GetField("_restartStarted", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                    .SetValue(restarting, System.Diagnostics.Stopwatch.GetTimestamp() - System.Diagnostics.Stopwatch.Frequency * 3601L);
+                var closing = (Task)typeof(MainForm).GetMethod("CheckScheduledRestartAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                    .Invoke(restarting, null)!;
+                wait.Restart();
+                while (!closing.IsCompleted && wait.Elapsed < TimeSpan.FromSeconds(5))
+                { Application.DoEvents(); Thread.Sleep(5); }
+                if (!closing.IsCompleted || !Program.RestartRequested || scheduler.IsRunning || !restarting.IsDisposed)
+                    throw new InvalidOperationException("定时到期未执行暂存收尾、关闭窗体及请求自动重启。");
+                closing.GetAwaiter().GetResult();
+                Program.RestartRequested = false; // Test the shutdown boundary without launching a production app.
+                Program.RestartResumeToken = null;
+            }
+            return "PASS\n设计器控件恢复、文本/数值/开关事件保存、Worker/IP重试双向绑定、实时日志、四项状态栏后台采样、摘要及布局渲染通过；自动启动仅触发一次；重启分钟保存、运行中锁定、模拟到期触发暂存收尾/关闭窗体/请求重启通过。任务HTTP全部使用空列表桩，无浏览器启动、无真实接口请求、未创建真实开机启动快捷方式，未启动额外生产进程。";
         }
         finally
         {
+            Program.RestartRequested = false;
+            Program.RestartResumeToken = null;
             scheduler.DisposeAsync().AsTask().GetAwaiter().GetResult();
             AppLogging.SetVerbose(false);
         }

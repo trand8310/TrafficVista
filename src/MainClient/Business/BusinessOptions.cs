@@ -12,8 +12,11 @@ public sealed record BusinessOptions
     public int MaxDwellSeconds { get; init; } = 86400;
     public string StaticCacheRoot { get; init; } = "business/static-cache";
     public int StaticCacheMaxMegabytes { get; init; } = 512;
+    public int StaticCacheMemoryMegabytes { get; init; } = 64;
+    public int StaticCacheMaxMemoryEntryMegabytes { get; init; } = 4;
+    public int StaticCacheWriteQueueCapacity { get; init; } = 32;
     public int StaticCacheTtlHours { get; init; } = 24;
-    /// <summary>旧配置兼容默认值；新界面使用TrafficVista:TaskWorkerCount。</summary>
+    /// <summary>旧配置兼容默认值；新界面使用TrafficVista:MaxConcurrency。</summary>
     public int MaxConcurrentTasks { get; init; } = 4;
     public int SessionRetentionDays { get; init; } = 7;
     public int SessionMaxMegabytes { get; init; } = 1024;
@@ -25,12 +28,19 @@ public sealed record BusinessOptions
     public bool ExportRunData { get; init; } = false;
     /// <summary>Chrome启动后，Context、页面及环境设置共用的准备超时。</summary>
     public int BrowserSetupTimeoutSeconds { get; init; } = 20;
+    public int BrowserCloseGraceMilliseconds { get; init; } = 1000;
+    public int TaskIntakePauseBrowserQueue { get; init; } = 100;
+    public int TaskIntakeResumeBrowserQueue { get; init; } = 50;
     public string ChromeExecutablePath { get; init; } = "File/chrome-win/145.0.7632.110/chrome.exe";
 
     public void Validate()
     {
         if (!Enum.IsDefined(TaskRecoveryMode)) throw new ArgumentOutOfRangeException(nameof(TaskRecoveryMode));
+        if (TaskIntakePauseBrowserQueue < 1 || TaskIntakeResumeBrowserQueue < 0
+            || TaskIntakeResumeBrowserQueue >= TaskIntakePauseBrowserQueue)
+            throw new ArgumentOutOfRangeException(nameof(TaskIntakeResumeBrowserQueue), "任务领取恢复阈值必须非负且小于暂停阈值。");
         if (BrowserSetupTimeoutSeconds is < 1 or > 120) throw new ArgumentOutOfRangeException(nameof(BrowserSetupTimeoutSeconds));
+        if (BrowserCloseGraceMilliseconds is < 100 or > 10000) throw new ArgumentOutOfRangeException(nameof(BrowserCloseGraceMilliseconds));
         if (string.IsNullOrWhiteSpace(SessionRoot)) throw new InvalidOperationException("业务会话目录不能为空。");
         if (string.IsNullOrWhiteSpace(RecoveryRoot)) throw new InvalidOperationException("任务恢复目录不能为空。");
         if (MaxUvPerTask is < 1 or > 1000000) throw new ArgumentOutOfRangeException(nameof(MaxUvPerTask));
@@ -38,6 +48,9 @@ public sealed record BusinessOptions
         if (MaxDwellSeconds is < 0 or > 86400) throw new ArgumentOutOfRangeException(nameof(MaxDwellSeconds));
         if (string.IsNullOrWhiteSpace(StaticCacheRoot)) throw new InvalidOperationException("静态资源缓存目录不能为空。");
         if (StaticCacheMaxMegabytes is < 16 or > 8192) throw new ArgumentOutOfRangeException(nameof(StaticCacheMaxMegabytes));
+        if (StaticCacheMemoryMegabytes is < 0 or > 4096) throw new ArgumentOutOfRangeException(nameof(StaticCacheMemoryMegabytes));
+        if (StaticCacheMaxMemoryEntryMegabytes is < 1 or > 64) throw new ArgumentOutOfRangeException(nameof(StaticCacheMaxMemoryEntryMegabytes));
+        if (StaticCacheWriteQueueCapacity is < 1 or > 4096) throw new ArgumentOutOfRangeException(nameof(StaticCacheWriteQueueCapacity));
         if (StaticCacheTtlHours is < 1 or > 8760) throw new ArgumentOutOfRangeException(nameof(StaticCacheTtlHours));
         if (MaxConcurrentTasks is < 1 or > 64) throw new ArgumentOutOfRangeException(nameof(MaxConcurrentTasks));
         if (SessionRetentionDays is < 1 or > 3650) throw new ArgumentOutOfRangeException(nameof(SessionRetentionDays));

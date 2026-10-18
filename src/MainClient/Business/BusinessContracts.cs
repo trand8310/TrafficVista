@@ -43,6 +43,8 @@ public sealed record BusinessUvRun(long TaskId, long UvId, Uri Target, string Di
     BusinessDeviceProfile Device, BusinessProxy? Proxy, TrafficVistaOptions Options,
     TimeSpan Dwell, int PageViews, JObject? Jstext)
 {
+    public int WorkerId { get; init; }
+    internal Action? BrowserStartQueued { get; init; }
     public TimeSpan? MaximumDwell { get; init; }
     public TimeSpan NextDwell() => MaximumDwell is { } max
         ? Dwell + TimeSpan.FromSeconds(Random.Shared.NextDouble() * (max - Dwell).TotalSeconds) : Dwell;

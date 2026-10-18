@@ -37,7 +37,7 @@ public sealed class NetProxyProvider(IProxyService proxies, ILogger logger, IPro
             catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
-                logger.Error(ex, "直连IP信息查询失败，TaskId={TaskId}，未领取代理", task.Id);
+                logger.Warning(ex, "直连IP信息查询失败，TaskId={TaskId}，未领取代理", task.Id);
                 throw;
             }
         }

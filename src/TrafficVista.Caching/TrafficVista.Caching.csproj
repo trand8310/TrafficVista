@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>TrafficVista.Caching</PackageId>
+    <Version>1.0.0</Version>
+    <Description>Memory and disk resource cache with coordinated concurrent fills.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+  <ItemGroup><None Include="README.md" Pack="true" PackagePath="/" /></ItemGroup>
+</Project>

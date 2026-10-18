@@ -25,6 +25,7 @@ internal static class AppLogging
             .Enrich.WithProperty("ProcessId", Environment.ProcessId)
             .Enrich.WithProperty("RunId", Guid.NewGuid().ToString("N"))
             .Enrich.WithProperty("RunMode", testMode ? "self-test" : "interactive")
+            .Enrich.With(new UiLogging.WorkerIdEnricher())
             .WriteTo.Sink(new UiLogging.LiveLogSink(LiveLogs));
         var fileEnabled = testMode;
         if (!testMode)
@@ -48,7 +49,7 @@ internal static class AppLogging
                 buffered: false,
                 shared: true,
                 encoding: new UTF8Encoding(false),
-                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] [PID:{ProcessId}] [Run:{RunId}] [{RunMode}] [{SourceContext}] [Instance:{InstanceId}] {Message:lj}{NewLine}{Exception}");
+                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] [Worker:{WorkerId}] [PID:{ProcessId}] [Run:{RunId}] [{RunMode}] [{SourceContext}] [Instance:{InstanceId}] {Message:lj}{NewLine}{Exception}");
         }
         Log.Logger = configuration.CreateLogger();
     }

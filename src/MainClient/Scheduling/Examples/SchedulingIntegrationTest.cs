@@ -19,8 +19,10 @@ internal static class SchedulingIntegrationTest
         var handler = new FakeTaskHandler();
         using var client = new HttpClient(handler);
         var source = new HttpTaskSource(client, Log.Logger);
+        using var launches = new BrowserLaunchLimiter(7, 0);
         await using var scheduler = new TaskSchedulingService(Log.Logger, settings, source,
-            new DelegateTaskConsumer<TaskEnvelope>((_, token) => { token.ThrowIfCancellationRequested(); return ValueTask.FromResult(true); }));
+            new DelegateTaskConsumer<TaskEnvelope>((_, token) => { token.ThrowIfCancellationRequested(); return ValueTask.FromResult(true); }),
+            launches: launches);
         var ui = settings.Value with
         {
             TaskApiUrl = "http://127.0.0.1:6617/client-v5.php?action=getTask&name=old&other=keep",
@@ -28,6 +30,8 @@ internal static class SchedulingIntegrationTest
         };
         var options = settings.CreateSchedulerOptions(ui) with { StopTimeout = TimeSpan.FromSeconds(5) };
         await scheduler.StartAsync(ui, options);
+        if (launches.MaxConcurrentStarts != settings.MaxConcurrentBrowserStarts || scheduler.Snapshot.Workers != ui.MaxConcurrency)
+            throw new InvalidOperationException("任务并发数或内部浏览器启动限制映射失败。");
         var rejected = false;
         try { await scheduler.StartAsync(ui, options); }
         catch (InvalidOperationException) { rejected = true; }
@@ -56,7 +60,9 @@ internal static class SchedulingIntegrationTest
         var tasks = HttpTaskSource.ParseResponse(Encoding.UTF8.GetBytes(FakeTaskHandler.TaskJson));
         if (tasks.Count != 1 || tasks[0].Id != 43135 || tasks[0].Payload!.Value<int>("uv") != 12)
             throw new InvalidOperationException("任务解析或原始字段保留失败。");
-        return "PASS\nGET/name 参数编码、有任务解析、原始字段保留、无任务持续轮询、重复启动拒绝、Cancel/Drain、停止后不再拉取和重启通过。\n使用本地模拟接口及空业务消费者；不启动浏览器。";
+        await TaskFetchDiagnosticsTest.RunAsync(directory);
+        await WorkerIdentityIntegrationTest.RunAsync(directory);
+        return "PASS\nGET/name 参数编码、有任务解析、原始字段保留、无任务持续轮询、重复启动拒绝、Cancel/Drain、停止后不再拉取和重启通过。\n任务接口请求/空响应/失败/中断统计、响应头与正文等待、轮询/重试倒计时、满队列等待、拉取超时与执行超时区分、日志及新轮次重置通过。\n使用本地模拟接口及空业务消费者；不启动浏览器。";
     }
 
     private sealed class FakeTaskHandler : HttpMessageHandler

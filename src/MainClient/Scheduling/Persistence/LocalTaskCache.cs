@@ -199,6 +199,11 @@ internal sealed class LocalTaskCache<T> : IAsyncDisposable
             _checkpointStop.Cancel();
             await _checkpoint.ConfigureAwait(false);
             if (_claims is not null) await _claims.DisposeAsync().ConfigureAwait(false);
+            if (_options.DeleteWhenEmpty && _pending.IsEmpty)
+            {
+                File.Delete(_options.FilePath);
+                File.Delete(_options.FilePath + ".consumed.jsonl");
+            }
         }
         finally
         {

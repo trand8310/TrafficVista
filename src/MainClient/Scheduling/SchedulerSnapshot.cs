@@ -1,7 +1,7 @@
 namespace TrafficVista.Scheduling;
 
 public enum SchedulerState { Stopped, Running, Stopping, Faulted, Disposed }
-public enum SchedulerStopMode { Drain, Cancel }
+public enum SchedulerStopMode { Drain, Cancel, Suspend }
 
 /// <summary>Live counters are sampled independently; final counters are stable.</summary>
 public sealed record SchedulerSnapshot
@@ -19,6 +19,8 @@ public sealed record SchedulerSnapshot
     public long Canceled { get; init; }
     public long Abandoned { get; init; }
     public long SourceErrors { get; init; }
+    public long SourceTimeouts { get; init; }
+    public ProducerStatusSnapshot Producer { get; init; } = new("未启动", 0, null);
     public string? LastError { get; init; }
     public long Restored { get; init; }
     public int Cached { get; init; }

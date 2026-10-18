@@ -1,4 +1,5 @@
 using Serilog.Events;
+using System.Globalization;
 
 namespace TrafficVista.UiLogging;
 
@@ -37,10 +38,13 @@ public sealed class LiveLogView : UserControl
         _list.ShowItemToolTips = true;
         _list.Columns.Add("时间", 105);
         _list.Columns.Add("级别", 60);
+        _list.Columns.Add("工作者", 70);
         _list.Columns.Add("消息（双击查看详情）", 800);
         _list.RetrieveVirtualItem += (_, e) => e.Item = CreateItem(e.ItemIndex);
         _list.DoubleClick += (_, _) => ShowDetails();
-        _list.Resize += (_, _) => _list.Columns[2].Width = Math.Max(250, _list.ClientSize.Width - 190);
+        _list.Resize += (_, _) => ResizeColumns();
+        FontChanged += (_, _) => ResizeColumns();
+        DpiChangedAfterParent += (_, _) => ResizeColumns();
         var clear = new ToolStripButton("清空显示");
         clear.Click += (_, _) => ClearDisplay();
         _tools.Items.AddRange(new ToolStripItem[] { new ToolStripLabel("实时日志"), new ToolStripSeparator(), _pause, _follow, clear, new ToolStripSeparator(), _summary });
@@ -50,6 +54,16 @@ public sealed class LiveLogView : UserControl
         // A hidden/disposed form has no UI refresh work or background event subscriptions.
         VisibleChanged += (_, _) => { if (Visible && !IsDisposed) _timer.Start(); else _timer.Stop(); };
         UpdateSummary();
+    }
+
+    private void ResizeColumns()
+    {
+        var gap = (int)Math.Ceiling(16 * DeviceDpi / 96.0);
+        _list.Columns[0].Width = TextRenderer.MeasureText("00:00:00.000", Font).Width + gap;
+        _list.Columns[1].Width = TextRenderer.MeasureText("警告", Font).Width + gap;
+        _list.Columns[2].Width = TextRenderer.MeasureText("工作者", Font).Width + gap;
+        _list.Columns[3].Width = Math.Max((int)(180 * DeviceDpi / 96.0), _list.ClientSize.Width
+            - _list.Columns[0].Width - _list.Columns[1].Width - _list.Columns[2].Width - gap);
     }
 
     internal void FlushPending()
@@ -100,7 +114,7 @@ public sealed class LiveLogView : UserControl
         var entry = Entry(index);
         var level = entry.Level switch { LogEventLevel.Verbose => "跟踪", LogEventLevel.Debug => "调试",
             LogEventLevel.Information => "信息", LogEventLevel.Warning => "警告", LogEventLevel.Error => "错误", _ => "严重" };
-        return new ListViewItem(new[] { entry.Time, level, entry.Text.Replace("\r", "").Replace("\n", " ↵ ") })
+        return new ListViewItem(new[] { entry.Time, level, entry.WorkerId.ToString(CultureInfo.InvariantCulture), entry.Text.Replace("\r", "").Replace("\n", " ↵ ") })
         { ToolTipText = entry.Text, ForeColor = entry.Level >= LogEventLevel.Error ? Color.Firebrick
             : entry.Level == LogEventLevel.Warning ? Color.DarkOrange : entry.Level <= LogEventLevel.Debug ? Color.Gray : SystemColors.WindowText };
     }
@@ -110,7 +124,7 @@ public sealed class LiveLogView : UserControl
     {
         if (_list.SelectedIndices.Count == 0) return;
         var entry = Entry(_list.SelectedIndices[0]);
-        var dialog = new Form { Text = $"日志详情 · {entry.Time} · {entry.Level}", Size = new(850, 450), StartPosition = FormStartPosition.CenterParent };
+        var dialog = new Form { Text = $"日志详情 · {entry.Time} · {entry.Level} · 工作者 {entry.WorkerId}", Size = new(850, 450), StartPosition = FormStartPosition.CenterParent };
         dialog.Controls.Add(new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both,
             WordWrap = false, Dock = DockStyle.Fill, Text = entry.Text });
         dialog.Show(this);

@@ -22,11 +22,12 @@ internal static class AppServices
         services.AddOptions();
         services.AddSingleton(_ => new TrafficVistaSettings(AppContext.BaseDirectory));
         services.AddSingleton<IOptions<TrafficVistaOptions>>(provider => provider.GetRequiredService<TrafficVistaSettings>());
-        // 在 Main 的 UI 消息循环启动前解析；只有这里创建并由容器释放 IPlaywright。
+        // Legacy browser self-tests use this singleton; business drivers are independently owned and lazy.
         services.AddSingleton<IPlaywright>(_ => Playwright.CreateAsync().GetAwaiter().GetResult());
         services.AddSingleton(provider => new BrowserLaunchLimiter(
             provider.GetRequiredService<TrafficVistaSettings>().MaxConcurrentBrowserStarts,
-            provider.GetRequiredService<TrafficVistaSettings>().BrowserStartIntervalMilliseconds));
+            provider.GetRequiredService<TrafficVistaSettings>().BrowserStartIntervalMilliseconds,
+            () => SystemPressureProbe.Shared.Latest));
         services.AddSingleton(provider => new ChromeInstanceManager(
             provider.GetRequiredService<IPlaywright>(), provider.GetRequiredService<BrowserLaunchLimiter>(),
             logger, userRoot));
@@ -45,7 +46,11 @@ internal static class AppServices
         services.AddSingleton<IBusinessProxyProvider, NetProxyProvider>();
         services.AddSingleton<SharedStaticResourceCache>();
         services.AddSingleton<BusinessMetrics>();
-        services.AddSingleton<IBusinessUvRunner, BusinessUvBrowserRunner>();
+        services.AddSingleton<BusinessPlaywrightDrivers>();
+        services.AddSingleton<IBusinessUvRunner>(provider => new BusinessUvBrowserRunner(null,
+            provider.GetRequiredService<BrowserLaunchLimiter>(), provider.GetRequiredService<SharedStaticResourceCache>(),
+            logger, provider.GetRequiredService<BusinessMetrics>(), provider.GetRequiredService<BusinessOptions>(),
+            provider.GetRequiredService<BusinessPlaywrightDrivers>()));
         services.AddSingleton<BrowserTaskConsumer>();
         services.AddSingleton<ITaskConsumer<Contracts.TaskEnvelope>>(provider =>
             provider.GetRequiredService<BrowserTaskConsumer>());
